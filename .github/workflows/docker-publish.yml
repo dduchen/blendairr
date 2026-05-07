@@ -1,0 +1,85 @@
+# .github/workflows/docker-publish.yml
+#
+# Builds the blendAIRR Docker image and pushes it to GitHub Container Registry
+# (ghcr.io) automatically on every push to main and on every version tag.
+#
+# Image available at:
+#   ghcr.io/YOUR_ORG/blendAIRR:latest
+#   ghcr.io/YOUR_ORG/blendAIRR:1.0.0    (on tag v1.0.0)
+#
+# To use:
+#   docker pull ghcr.io/YOUR_ORG/blendAIRR:latest
+
+name: Build and publish blendAIRR
+
+on:
+  push:
+    branches: [main]
+    tags:     ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY:   ghcr.io
+  IMAGE_NAME: ${{ github.repository }}   # resolves to YOUR_ORG/blendAIRR
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tag strategy:
+      #   main branch -> :latest  :main  :sha-abc1234
+      #   tag v1.2.3  -> :1.2.3  :1.2  :1  :latest
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags:   ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # ── Pin versions here for reproducible production builds ──
+          # Find PIgLET commit hashes at:
+          #   https://bitbucket.org/yaarilab/piglet/commits/
+          build-args: |
+            IGBLAST_VERSION=1.22.0
+            PIGLET_COMMIT=4f39829
+          # Layer cache: only changed layers are rebuilt on subsequent runs
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Print image digest
+        if: github.event_name != 'pull_request'
+        run: echo "Pushed digest ${{ steps.build.outputs.digest }}"

@@ -1,0 +1,19 @@
+# docker-compose.yml — blendAIRR local convenience wrapper
+#
+# Usage:
+#   docker compose run blendairr --species mouse --input_dir /data/MRL --outdir /data/out
+#
+# Mount your local data directory by setting DATA_DIR:
+#   DATA_DIR=/path/to/your/data docker compose run blendairr --species mouse ...
+
+services:
+  blendairr:
+    image: ghcr.io/YOUR_ORG/blendAIRR:latest
+    build:
+      context: .
+      args:
+        IGBLAST_VERSION: "1.22.0"
+        PIGLET_COMMIT: "HEAD"        # replace with a specific commit hash
+    volumes:
+      - ${DATA_DIR:-./data}:/data    # mount your data directory here
+    working_dir: /data

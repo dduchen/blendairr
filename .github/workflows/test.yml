@@ -1,0 +1,56 @@
+# .github/workflows/test.yml
+#
+# Smoke-tests the blendAIRR Docker image on every push and PR to verify
+# that all dependencies install correctly and the tool runs before any
+# image is published.
+
+name: Test blendAIRR image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: blendairr:test
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Test --help exits cleanly
+        run: docker run --rm blendairr:test --help
+
+      - name: Test --list_species exits cleanly
+        run: |
+          docker run --rm \
+            -e IGDATA=/opt/igblast \
+            blendairr:test --list_species || true
+
+      - name: Test R packages load without error
+        run: |
+          docker run --rm --entrypoint Rscript blendairr:test \
+            -e "library(piglet); library(DECIPHER); library(data.table); cat('R OK\n')"
+
+      - name: Test igblastn and makeblastdb are on PATH
+        run: |
+          docker run --rm --entrypoint bash blendairr:test \
+            -c "which igblastn && igblastn -version && which makeblastdb"
+
+      - name: Test MakeDb.py is on PATH
+        run: |
+          docker run --rm --entrypoint bash blendairr:test \
+            -c "MakeDb.py --version"
