@@ -4,8 +4,8 @@
 
 **Build hybrid IgBLAST germline reference databases for custom or non-reference species**
 
-[![Docker](https://img.shields.io/badge/container-ghcr.io-blue?logo=docker)](https://github.com/YOUR_ORG/blendAIRR/pkgs/container/blendAIRR)
-[![Build](https://github.com/YOUR_ORG/blendAIRR/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/YOUR_ORG/blendAIRR/actions/workflows/docker-publish.yml)
+[![Docker](https://img.shields.io/badge/container-ghcr.io-blue?logo=docker)](https://github.com/dduchen/blendairr/pkgs/container/blendAIRR)
+[![Build](https://github.com/dduchen/blendairr/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/dduchen/blendairr/actions/workflows/docker-publish.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 </div>
@@ -24,12 +24,12 @@ The result is a ready-to-run IgBLAST database with all required auxiliary, annot
 
 ```bash
 # Pull
-docker pull ghcr.io/YOUR_ORG/blendAIRR:latest
+docker pull ghcr.io/dduchen/blendairr:latest
 
 # Run — mount the directory containing your input FASTAs
 docker run --rm \
   -v "$(pwd)/data":/data \
-  ghcr.io/YOUR_ORG/blendAIRR:latest \
+  ghcr.io/dduchen/blendairr:latest \
   --species mouse \
   --input_dir /data/MRL \
   --outdir /data/mrl_ref
@@ -42,7 +42,7 @@ bash data/mrl_ref/hybrid_run_light.sh sequences.fasta out_prefix
 ### Singularity / HPC
 
 ```bash
-singularity pull docker://ghcr.io/YOUR_ORG/blendAIRR:latest
+singularity pull docker://ghcr.io/dduchen/blendairr:latest
 
 singularity run blendAIRR_latest.sif \
   --species mouse \
@@ -85,7 +85,7 @@ Files may also sit directly in `input_dir/` without subdirectories.
 | `--skip_blast` | | Skip `makeblastdb` — annotation only. |
 | `--list_species` | | List available IMGT species and exit. |
 
-Run `build_hybrid_igblast_ref --help` (or `docker run --rm ghcr.io/YOUR_ORG/blendAIRR --help`) for the full argument reference.
+Run `build_hybrid_igblast_ref --help` (or `docker run --rm ghcr.io/dduchen/blendairr --help`) for the full argument reference.
 
 ---
 
@@ -133,7 +133,7 @@ bash outdir/hybrid_install_to_igdata.sh ~/share/igblast
 ## Building locally
 
 ```bash
-git clone https://github.com/YOUR_ORG/blendAIRR
+git clone https://github.com/dduchen/blendairr
 cd blendAIRR
 
 # Build
@@ -163,7 +163,7 @@ Images are built and pushed automatically by the CI/CD pipeline on every push to
 
 Pin to a specific release for reproducible workflows:
 ```bash
-docker pull ghcr.io/YOUR_ORG/blendAIRR:1.0.0
+docker pull ghcr.io/dduchen/blendairr:1.0.0
 ```
 
 ---
@@ -181,4 +181,4 @@ If you use blendAIRR, please cite:
 
 ## License
 
-MIT © YOUR_ORG
+MIT © dduchen

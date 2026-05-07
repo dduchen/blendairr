@@ -3,7 +3,7 @@
 
 IMAGE        ?= blendairr
 TAG          ?= local
-REGISTRY     ?= ghcr.io/YOUR_ORG
+REGISTRY     ?= ghcr.io/dduchen
 DATA_DIR     ?= $(PWD)/data
 IGBLAST_VER  ?= 1.22.0
 PIGLET_COMMIT ?= HEAD

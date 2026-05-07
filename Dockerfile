@@ -17,8 +17,8 @@ FROM rocker/r-ver:4.4.1
 
 LABEL org.opencontainers.image.title="blendAIRR" \
       org.opencontainers.image.description="Build hybrid IgBLAST germline reference databases for custom or non-reference species" \
-      org.opencontainers.image.source="https://github.com/YOUR_ORG/blendAIRR" \
-      org.opencontainers.image.documentation="https://github.com/YOUR_ORG/blendAIRR/blob/main/README.md" \
+      org.opencontainers.image.source="https://github.com/dduchen/blendairr" \
+      org.opencontainers.image.documentation="https://github.com/dduchen/blendairr/blob/main/README.md" \
       org.opencontainers.image.licenses="MIT"
 
 # ---------------------------------------------------------------------------

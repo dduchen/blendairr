@@ -4,11 +4,11 @@
 # (ghcr.io) automatically on every push to main and on every version tag.
 #
 # Image available at:
-#   ghcr.io/YOUR_ORG/blendAIRR:latest
-#   ghcr.io/YOUR_ORG/blendAIRR:1.0.0    (on tag v1.0.0)
+#   ghcr.io/dduchen/blendairr:latest
+#   ghcr.io/dduchen/blendairr:1.0.0    (on tag v1.0.0)
 #
 # To use:
-#   docker pull ghcr.io/YOUR_ORG/blendAIRR:latest
+#   docker pull ghcr.io/dduchen/blendairr:latest
 
 name: Build and publish blendAIRR
 
@@ -22,7 +22,7 @@ on:
 
 env:
   REGISTRY:   ghcr.io
-  IMAGE_NAME: ${{ github.repository }}   # resolves to YOUR_ORG/blendAIRR
+  IMAGE_NAME: ${{ github.repository }}   # resolves to dduchen/blendairr
 
 jobs:
   build-and-push:
@@ -75,7 +75,7 @@ jobs:
           #   https://bitbucket.org/yaarilab/piglet/commits/
           build-args: |
             IGBLAST_VERSION=1.22.0
-            PIGLET_COMMIT=4f39829
+            PIGLET_COMMIT=HEAD
           # Layer cache: only changed layers are rebuilt on subsequent runs
           cache-from: type=gha
           cache-to:   type=gha,mode=max
