@@ -95,18 +95,16 @@ RUN Rscript -e "\
   BiocManager::install(c('Biostrings','DECIPHER'), ask=FALSE, update=FALSE)"
 
 # ---------------------------------------------------------------------------
-# 5. PIgLET — from Bitbucket
-#    Pin PIGLET_COMMIT to a specific commit hash for reproducibility.
-#    Find hashes at: https://bitbucket.org/yaarilab/piglet/commits/
-#    Leave as HEAD to always get the latest (less reproducible).
+# 5. PIgLET — from CRAN (published as of 2023, doi:10.1093/nar/gkad603)
+#    Pin to a specific version for reproducibility; update when needed.
 # ---------------------------------------------------------------------------
-ARG PIGLET_COMMIT=HEAD
+ARG PIGLET_VERSION=1.0.2
 RUN Rscript -e "\
-  message('Installing PIgLET from Bitbucket (ref=${PIGLET_COMMIT})...'); \
-  remotes::install_bitbucket('yaarilab/piglet', ref='${PIGLET_COMMIT}', \
-                              upgrade='never', quiet=FALSE); \
+  message('Installing PIgLET ', '${PIGLET_VERSION}', ' from CRAN...'); \
+  install.packages('piglet', repos='https://cloud.r-project.org', \
+                   version='${PIGLET_VERSION}'); \
   library(piglet); \
-  message('PIgLET installed and loads OK: ', packageVersion('piglet'))"
+  message('PIgLET OK: ', packageVersion('piglet'))"
 
 # ---------------------------------------------------------------------------
 # 6. Verify all dependencies load before shipping the image
