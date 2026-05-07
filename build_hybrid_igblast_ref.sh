@@ -1,0 +1,1268 @@
+#!/usr/bin/env bash
+# =============================================================================
+# build_hybrid_igblast_ref.sh
+#
+# DESCRIPTION
+#   Builds a hybrid IgBLAST germline reference database by merging custom
+#   species germline sequences (e.g. from a non-reference mouse strain) with
+#   the closest available IMGT reference species (e.g. mouse).
+#
+#   Novel sequences are jointly clustered with the reference set using PIgLET,
+#   which assigns each novel allele an IMGT-style gene-family name based on
+#   co-clustering with known reference alleles.  The result is a ready-to-run
+#   IgBLAST database with matching auxiliary and annotation files.
+#
+# QUICK START
+#   bash build_hybrid_igblast_ref.sh \
+#       --species mouse \
+#       --input_dir ./MRL/ \
+#       --outdir ./mrl_igblast_ref
+#
+#   Then annotate sequences:
+#   bash ./mrl_igblast_ref/hybrid_run_heavy.sh sequences.fasta out_prefix
+#   bash ./mrl_igblast_ref/hybrid_run_light.sh sequences.fasta out_prefix
+#
+# REQUIRED ARGUMENTS
+#   -s, --species SPECIES   Closest IMGT reference species for co-clustering.
+#                           Must match a species available in your IGDATA
+#                           germline directory (e.g. mouse, human, rat).
+#                           Run --list_species to see what is available.
+#
+#   -i, --input_dir DIR     Directory containing your custom germline FASTA
+#                           files. Expected layout:
+#                             DIR/heavy/IGHV.fasta  (required)
+#                             DIR/heavy/IGHD.fasta  (optional)
+#                             DIR/heavy/IGHJ.fasta  (optional)
+#                             DIR/light/IGKV.fasta  (optional)
+#                             DIR/light/IGKJ.fasta  (optional)
+#                             DIR/light/IGLV.fasta  (optional)
+#                             DIR/light/IGLJ.fasta  (optional)
+#                           Files may also sit directly in DIR/ without
+#                           subdirectories.  All V files must be IMGT-gapped
+#                           (dots for gap positions, 312 nt V region).
+#                           Missing files are filled from the reference species.
+#
+#   -o, --outdir DIR        Output directory (created if absent). All outputs
+#                           are written here -- see OUTPUT FOLDERS below.
+#
+# OPTIONAL ARGUMENTS
+#   -g, --igdata DIR        IgBLAST share directory containing internal_data/
+#                           and optional_file/. Defaults to the $IGDATA
+#                           environment variable or auto-detection from PATH.
+#   -p, --prefix STR        Prefix for all output filenames (default: hybrid).
+#   -r, --rscript PATH      Full path to Rscript binary (default: auto-detect).
+#   -e, --edit_imgt PATH    Path to edit_imgt_file.pl from the IgBLAST package
+#                           (default: auto-detect next to igblastn in PATH).
+#   --asc                   Use PIgLET ASC cluster names (e.g. IGHVFx-Gy*01)
+#                           instead of the default IMGT-style names derived
+#                           from the closest reference allele.
+#   --skip_blast            Skip the makeblastdb step (annotation only).
+#   --skip_constant         Skip building the constant region database.
+#   --family_threshold N    PIgLET gene-family clustering threshold (default: 75).
+#   --allele_threshold N    PIgLET allele cluster threshold (default: 95).
+#   --v_trim3 N             3-prime trim length for V clustering (default: 318).
+#   --j_trim3 N             3-prime trim length for J clustering (default: 40).
+#   --list_species          List available IMGT species in IGDATA and exit.
+#   -h, --help              Show this help message and exit.
+#
+# OUTPUT FOLDERS  (all under --outdir)
+#   germlines/gapped/       Hybrid gapped FASTAs — pass these to MakeDb.py -r
+#   germlines/ungapped/     Ungapped FASTAs (intermediate; not needed directly)
+#   fasta/                  edit_imgt_file.pl-processed FASTAs (BLAST input)
+#   database/               IgBLAST BLAST databases built by makeblastdb
+#   auxiliary/              J-gene aux file and V-gene ndm.imgt annotation
+#   internal_data/<species> Internal BLAST DBs required by igblastn -organism
+#   annotations/            PIgLET cluster tables, header maps, provenance TSVs
+#   logs/                   Per-step log files
+#
+# OUTPUT SCRIPTS  (in --outdir root)
+#   <prefix>_run_heavy.sh         igblastn + MakeDb.py pipeline for IGH
+#   <prefix>_run_light.sh         igblastn + MakeDb.py pipeline for IGK + IGL
+#   <prefix>_install_to_igdata.sh Copy reference files into an IGDATA directory
+#   <prefix>_igblast_cmd.sh       Low-level igblastn wrapper (all chains)
+#   <prefix>_manifest.tsv         Inventory of all output files with sizes
+# =============================================================================
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+SPECIES=""
+INPUT_DIR=""
+OUTDIR=""
+IGDATA="${IGDATA:-}"
+PREFIX="hybrid"
+RSCRIPT=""
+EDIT_IMGT=""
+SKIP_BLAST=false
+SKIP_CONSTANT=false
+FAM_THRESH=75
+ALLELE_THRESH=95
+V_TRIM3=318
+J_TRIM3=40
+LIST_SPECIES=false
+USE_ASC=false
+CHAIN="all"   # heavy | light | all
+
+# ---------------------------------------------------------------------------
+# Colours
+# ---------------------------------------------------------------------------
+RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
+BLUE='\033[0;34m'; NC='\033[0m'; BOLD='\033[1m'
+
+info()  { echo -e "${BLUE}[INFO]${NC}  $*"; }
+ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+err()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+die()   { err "$*"; exit 1; }
+header(){ echo -e "\n${BOLD}=== $* ===${NC}"; }
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+usage() {
+  # Print everything from the DESCRIPTION line to the end of the header block
+  sed -n '/^# DESCRIPTION/,/^# ===/p' "$0" | grep '^#' | sed 's/^# \?//'
+  exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s|--species)           SPECIES="$2";        shift 2 ;;
+    -i|--input_dir)         INPUT_DIR="$2";      shift 2 ;;
+    -o|--outdir)            OUTDIR="$2";         shift 2 ;;
+    -g|--igdata)            IGDATA="$2";         shift 2 ;;
+    -p|--prefix)            PREFIX="$2";         shift 2 ;;
+    -r|--rscript)           RSCRIPT="$2";        shift 2 ;;
+    -e|--edit_imgt)         EDIT_IMGT="$2";      shift 2 ;;
+    --skip_blast)           SKIP_BLAST=true;     shift ;;
+    --skip_constant)        SKIP_CONSTANT=true;  shift ;;
+    --family_threshold)     FAM_THRESH="$2";     shift 2 ;;
+    --allele_threshold)     ALLELE_THRESH="$2";  shift 2 ;;
+    --v_trim3)              V_TRIM3="$2";        shift 2 ;;
+    --j_trim3)              J_TRIM3="$2";        shift 2 ;;
+    --list_species)         LIST_SPECIES=true;   shift ;;
+    --asc)                  USE_ASC=true;        shift ;;
+    --chain)                CHAIN="$2";          shift 2 ;;
+    -h|--help)              usage ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# Auto-detect IgBLAST
+# ---------------------------------------------------------------------------
+header "IgBLAST detection"
+
+detect_igblast() {
+  # Priority: explicit --igdata > $IGDATA env > common paths > igblastn in PATH
+  if [[ -n "$IGDATA" && -d "$IGDATA" ]]; then
+    echo "$IGDATA"; return
+  fi
+  for candidate in \
+      /usr/local/share/igblast \
+      /usr/share/igblast \
+      "$HOME/share/igblast" \
+      "$HOME/.local/share/igblast" \
+      /opt/igblast; do
+    [[ -d "$candidate" ]] && { echo "$candidate"; return; }
+  done
+  # Fall back to inferring from igblastn binary
+  if command -v igblastn &>/dev/null; then
+    bin_dir="$(dirname "$(command -v igblastn)")"
+    parent="$(dirname "$bin_dir")"
+    for sub in share/igblast igblast; do
+      [[ -d "$parent/$sub" ]] && { echo "$parent/$sub"; return; }
+    done
+    echo "$parent"   # best effort
+    return
+  fi
+  echo ""
+}
+
+IGDATA="$(detect_igblast)"
+if [[ -z "$IGDATA" ]]; then
+  warn "IgBLAST share directory not found."
+  warn "Set \$IGDATA or pass --igdata.  makeblastdb step will be skipped."
+  SKIP_BLAST=true
+else
+  ok "IgBLAST share: $IGDATA"
+fi
+
+# Check igblastn binary
+if command -v igblastn &>/dev/null; then
+  IGBLASTN_VERSION=$(igblastn -version 2>&1 | head -1)
+  ok "igblastn found: $IGBLASTN_VERSION"
+else
+  warn "igblastn not in PATH — will still build databases but cannot run alignment"
+fi
+
+# Check makeblastdb
+if command -v makeblastdb &>/dev/null; then
+  ok "makeblastdb found: $(makeblastdb -version 2>&1 | head -1)"
+else
+  warn "makeblastdb not in PATH"; SKIP_BLAST=true
+fi
+
+# ---------------------------------------------------------------------------
+# List available IMGT species and exit if requested
+# ---------------------------------------------------------------------------
+if $LIST_SPECIES; then
+  header "Available IMGT species in IGDATA"
+  if [[ -z "$IGDATA" ]]; then
+    die "Cannot list species: IGDATA not found"
+  fi
+  germline_base="$IGDATA/germlines/imgt"
+  if [[ ! -d "$germline_base" ]]; then
+    # Try alternate location
+    germline_base="$(find "$IGDATA" -maxdepth 3 -type d -name imgt 2>/dev/null | head -1)"
+  fi
+  if [[ -z "$germline_base" || ! -d "$germline_base" ]]; then
+    die "IMGT germline directory not found under $IGDATA"
+  fi
+  echo ""
+  echo "Germline base: $germline_base"
+  echo ""
+  echo "Available species (directories with vdj/ subdirectory):"
+  find "$germline_base" -mindepth 1 -maxdepth 1 -type d | while read -r d; do
+    sp="$(basename "$d")"
+    if [[ -d "$d/vdj" ]]; then
+      loci=$(ls "$d/vdj/"*V*.fasta 2>/dev/null | xargs -I{} basename {} .fasta \
+             | sed 's/imgt_[^_]*_//' | sed 's/V$//' | tr '\n' ' ' 2>/dev/null || echo "?")
+      printf "  %-20s  loci: %s\n" "$sp" "$loci"
+    fi
+  done
+  echo ""
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Validate required args
+# ---------------------------------------------------------------------------
+[[ -z "$SPECIES"   ]] && die "Missing required: --species"
+[[ -z "$INPUT_DIR" ]] && die "Missing required: --input_dir"
+[[ -z "$OUTDIR"    ]] && die "Missing required: --outdir"
+[[ -d "$INPUT_DIR" ]] || die "Input directory not found: $INPUT_DIR"
+
+# ---------------------------------------------------------------------------
+# Locate reference IMGT germline directory for chosen species
+# ---------------------------------------------------------------------------
+header "Locating reference germlines for species: $SPECIES"
+
+find_ref_vdj_dir() {
+  local sp="$1"
+  local base="$IGDATA/germlines/imgt"
+  # Try common layouts
+  for candidate in \
+      "$base/$sp/vdj" \
+      "$base/$sp" \
+      "$IGDATA/germlines/imgt_${sp}" \
+      "$IGDATA/../germlines/imgt/$sp/vdj"; do
+    [[ -d "$candidate" ]] && { echo "$candidate"; return; }
+  done
+  echo ""
+}
+
+REF_VDJ_DIR="$(find_ref_vdj_dir "$SPECIES")"
+if [[ -z "$REF_VDJ_DIR" ]]; then
+  warn "Reference VDJ directory not found for species '$SPECIES'."
+  warn "Will use custom sequences only (no joint clustering possible)."
+  REF_VDJ_DIR=""
+else
+  ok "Reference VDJ dir: $REF_VDJ_DIR"
+fi
+
+# Locate reference constant region directory
+REF_CONST_DIR=""
+for candidate in \
+    "$IGDATA/germlines/imgt/$SPECIES/constant" \
+    "$IGDATA/germlines/imgt/$SPECIES" \
+    "$IGDATA/../germlines/imgt/$SPECIES/constant"; do
+  [[ -d "$candidate" ]] && { REF_CONST_DIR="$candidate"; break; }
+done
+[[ -n "$REF_CONST_DIR" ]] && ok "Reference constant dir: $REF_CONST_DIR" \
+                           || warn "No constant region directory found for $SPECIES"
+
+# ---------------------------------------------------------------------------
+# Locate helper tools
+# ---------------------------------------------------------------------------
+header "Locating helper tools"
+
+# Rscript
+if [[ -z "$RSCRIPT" ]]; then
+  RSCRIPT="$(command -v Rscript 2>/dev/null || echo "")"
+fi
+[[ -z "$RSCRIPT" ]] && die "Rscript not found. Install R or pass --rscript."
+ok "Rscript: $RSCRIPT"
+
+# edit_imgt_file.pl
+if [[ -z "$EDIT_IMGT" ]]; then
+  for candidate in \
+      "$(command -v edit_imgt_file.pl 2>/dev/null)" \
+      "$IGDATA/../bin/edit_imgt_file.pl" \
+      "$IGDATA/bin/edit_imgt_file.pl" \
+      "$(dirname "$(command -v igblastn 2>/dev/null)")/edit_imgt_file.pl" \
+      "/usr/local/bin/edit_imgt_file.pl"; do
+    [[ -f "$candidate" ]] && { EDIT_IMGT="$candidate"; break; }
+  done
+fi
+if [[ -z "$EDIT_IMGT" || ! -f "$EDIT_IMGT" ]]; then
+  warn "edit_imgt_file.pl not found. Attempting to download from igblast GitHub..."
+  EDIT_IMGT="$SCRIPT_DIR/edit_imgt_file.pl"
+  curl -fsSL \
+    "https://raw.githubusercontent.com/psathyrella/igblast/master/bin/edit_imgt_file.pl" \
+    -o "$EDIT_IMGT" && chmod +x "$EDIT_IMGT" \
+    && ok "Downloaded edit_imgt_file.pl → $EDIT_IMGT" \
+    || { warn "Download failed. BLAST db construction may fail."; EDIT_IMGT=""; }
+else
+  ok "edit_imgt_file.pl: $EDIT_IMGT"
+fi
+
+# Check R packages
+header "Checking R package dependencies"
+$RSCRIPT - <<'RCHECK'
+pkgs <- c("optparse","data.table","DECIPHER","piglet","Biostrings","stringr")
+missing <- pkgs[!sapply(pkgs, requireNamespace, quietly=TRUE)]
+if (length(missing)) {
+  cat("MISSING R packages:", paste(missing, collapse=", "), "\n")
+  quit(status=1)
+} else {
+  cat("All required R packages found.\n")
+}
+RCHECK
+ok "R packages OK"
+
+# ---------------------------------------------------------------------------
+# Create output directories
+# ---------------------------------------------------------------------------
+header "Creating output directories"
+for d in \
+    "$OUTDIR/germlines/gapped" \
+    "$OUTDIR/germlines/ungapped" \
+    "$OUTDIR/fasta" \
+    "$OUTDIR/database" \
+    "$OUTDIR/internal_data" \
+    "$OUTDIR/auxiliary" \
+    "$OUTDIR/annotations" \
+    "$OUTDIR/logs"; do
+  mkdir -p "$d"
+done
+ok "Output root: $OUTDIR"
+
+# ---------------------------------------------------------------------------
+# Pre-Step: Write a debug R script to OUTDIR before invoking R at all.
+# This file exists even if the R script crashes immediately.
+# ---------------------------------------------------------------------------
+header "Pre-Step: Writing bash-level debug R script"
+
+DEBUG_R="$OUTDIR/${PREFIX}_debug_session.R"
+
+# Resolve per-locus file paths the same way the R script will
+_cpath() { # find custom file: $1=locus (e.g. IGHV)
+  local locus="${1:0:3}" seg="${1:3:1}"  # e.g. IGH / V
+  for f in \
+      "$INPUT_DIR/heavy/${locus}${seg}.fasta" \
+      "$INPUT_DIR/light/${locus}${seg}.fasta" \
+      "$INPUT_DIR/${locus}${seg}.fasta" \
+      "$INPUT_DIR/imgt_custom_${locus}${seg}.fasta"; do
+    [[ -f "$f" ]] && { echo "\"$f\""; return; }
+  done
+  echo "NULL"
+}
+_rpath() { # find reference file: $1=locus
+  local locus="${1:0:3}" seg="${1:3:1}"
+  local sp="$SPECIES"
+  for f in \
+      "$REF_VDJ_DIR/imgt_${sp}_${locus}${seg}.fasta" \
+      "$REF_VDJ_DIR/${locus}${seg}.fasta" \
+      "$REF_VDJ_DIR/${sp}/vdj/imgt_${sp}_${locus}${seg}.fasta"; do
+    [[ -f "$f" ]] && { echo "\"$f\""; return; }
+  done
+  echo "NULL"
+}
+
+cat > "$DEBUG_R" <<RDEBUG
+# ================================================================
+# Debug / interactive session script
+# Written by build_hybrid_igblast_ref.sh BEFORE invoking R,
+# so this file exists even when the R script crashes.
+# Source in R:  source("${DEBUG_R}")
+# ================================================================
+
+suppressPackageStartupMessages({
+  library(data.table); library(DECIPHER)
+  library(piglet);     library(Biostrings)
+})
+
+# ---- Parameters (mirrors CLI args passed to R) ----
+custom_dir    <- "$INPUT_DIR"
+ref_dir       <- "${REF_VDJ_DIR:-$INPUT_DIR}"
+species       <- "$SPECIES"
+outdir        <- "$OUTDIR"
+igdata        <- "$IGDATA"
+prefix        <- "$PREFIX"
+v_trim3       <- $V_TRIM3
+j_trim3       <- $J_TRIM3
+fam_thresh    <- $FAM_THRESH
+allele_thresh <- $ALLELE_THRESH
+
+# ---- Resolved input file paths ----
+custom_path_IGHV <- $(_cpath IGHV)
+ref_path_IGHV    <- $(_rpath IGHV)
+custom_path_IGHD <- $(_cpath IGHD)
+ref_path_IGHD    <- $(_rpath IGHD)
+custom_path_IGHJ <- $(_cpath IGHJ)
+ref_path_IGHJ    <- $(_rpath IGHJ)
+custom_path_IGKV <- $(_cpath IGKV)
+ref_path_IGKV    <- $(_rpath IGKV)
+custom_path_IGKJ <- $(_cpath IGKJ)
+ref_path_IGKJ    <- $(_rpath IGKJ)
+custom_path_IGLV <- $(_cpath IGLV)
+ref_path_IGLV    <- $(_rpath IGLV)
+custom_path_IGLJ <- $(_cpath IGLJ)
+ref_path_IGLJ    <- $(_rpath IGLJ)
+
+# ---- Load sequences (mirrors original working code) ----
+read_seq <- function(path) {
+  if (is.null(path) || identical(path, "NULL") || !file.exists(path))
+    return(NULL)
+  s <- readDNAStringSet(path)
+  names(s) <- gsub(" ", "", names(s))
+  s
+}
+
+custom_IGHV <- read_seq(custom_path_IGHV)
+ref_IGHV    <- read_seq(ref_path_IGHV)
+custom_IGKV <- read_seq(custom_path_IGKV)
+ref_IGKV    <- read_seq(ref_path_IGKV)
+custom_IGLV <- read_seq(custom_path_IGLV)
+ref_IGLV    <- read_seq(ref_path_IGLV)
+custom_IGHJ <- read_seq(custom_path_IGHJ)
+ref_IGHJ    <- read_seq(ref_path_IGHJ)
+custom_IGKJ <- read_seq(custom_path_IGKJ)
+ref_IGKJ    <- read_seq(ref_path_IGKJ)
+custom_IGLJ <- read_seq(custom_path_IGLJ)
+ref_IGLJ    <- read_seq(ref_path_IGLJ)
+custom_IGHD <- read_seq(custom_path_IGHD)
+ref_IGHD    <- read_seq(ref_path_IGHD)
+
+cat("Loaded sequences:\n")
+for (nm in c("IGHV","IGKV","IGLV","IGHJ","IGKJ","IGLJ","IGHD")) {
+  cust_n <- length(get(paste0("custom_", nm)))
+  ref_n  <- length(get(paste0("ref_",    nm)))
+  cat(sprintf("  %-6s  custom: %3d   ref: %3d\n", nm, cust_n, ref_n))
+}
+
+# ---- PIgLET: the critical named-vector fix ----
+# BUG:  as.character(DNAStringSet) drops names -> germ.dist subscript error
+# FIX:  setNames(as.character(seqs), names(seqs))
+# NOTE: pass GAPPED sequences; PIgLET handles internal trimming by position
+
+run_piglet_debug <- function(seqs_gapped, trim3, label = "") {
+  named_vec <- setNames(as.character(seqs_gapped), names(seqs_gapped))
+  cat(sprintf("Running PIgLET on %d seqs (%s)\n", length(named_vec), label))
+  piglet::inferAlleleClusters(
+    germline_set             = named_vec,
+    trim_3prime_side         = trim3,
+    mask_5prime_side         = 0L,
+    family_threshold         = fam_thresh,
+    allele_cluster_threshold = allele_thresh
+  )
+}
+
+# ---- Minimal sanity check ----
+if (!is.null(custom_IGHV)) {
+  cat("\nTesting PIgLET on custom IGHV alone...\n")
+  asc_ighv <- run_piglet_debug(custom_IGHV, trim3 = v_trim3, label = "IGHV")
+  print(head(asc_ighv@alleleClusterTable))
+}
+
+# ---- Joint set sanity check ----
+if (!is.null(custom_IGHV) && !is.null(ref_IGHV)) {
+  cat("\nBuilding joint IGHV set (ref first)...\n")
+  joint_ighv     <- c(ref_IGHV, custom_IGHV)
+  dup_content    <- duplicated(as.character(joint_ighv))
+  dup_name       <- duplicated(names(joint_ighv))
+  joint_dd       <- joint_ighv[!dup_content & !dup_name]
+  cat(sprintf("  ref: %d  custom: %d  joint dedup: %d\n",
+              length(ref_IGHV), length(custom_IGHV), length(joint_dd)))
+  cat("  Testing PIgLET on joint set...\n")
+  asc_joint <- run_piglet_debug(joint_dd, trim3 = v_trim3, label = "IGHV_joint")
+  print(head(asc_joint@alleleClusterTable))
+}
+
+# ---- Inspect outputs (available after a successful run) ----
+ann_dir    <- file.path(outdir, "annotations")
+gapped_dir <- file.path(outdir, "germlines", "gapped")
+
+# header_map    <- fread(file.path(ann_dir, paste0(prefix, "_header_normalisation_map.tsv")))
+# cluster_annot <- fread(file.path(ann_dir, paste0(prefix, "_allele_cluster_annotation.tsv")))
+# provenance    <- fread(file.path(ann_dir, paste0(prefix, "_full_provenance.tsv")))
+# hybrid_IGHV   <- readDNAStringSet(file.path(gapped_dir, paste0(prefix, "_IGHV.fasta")))
+RDEBUG
+
+info "Debug R script written: $DEBUG_R"
+
+# ---------------------------------------------------------------------------
+# Step 1: R annotation + germline construction
+# ---------------------------------------------------------------------------
+header "Step 1: PIgLET joint clustering and germline construction (R)"
+
+R_SCRIPT="$SCRIPT_DIR/R/piglet_annotate_and_build.R"
+[[ -f "$R_SCRIPT" ]] || die "R script not found: $R_SCRIPT"
+
+$RSCRIPT "$R_SCRIPT" \
+  --custom_dir        "$INPUT_DIR" \
+  --ref_dir           "${REF_VDJ_DIR:-$INPUT_DIR}" \
+  --species           "$SPECIES" \
+  --outdir            "$OUTDIR" \
+  --igdata            "$IGDATA" \
+  --prefix            "$PREFIX" \
+  --family_threshold  "$FAM_THRESH" \
+  --allele_cluster_threshold "$ALLELE_THRESH" \
+  --v_trim3prime      "$V_TRIM3" \
+  --j_trim3prime      "$J_TRIM3" \
+  $($USE_ASC && echo "--use_asc") \
+  2>&1 | tee "$OUTDIR/logs/piglet_annotate.log"
+
+ok "R annotation complete"
+
+# ---------------------------------------------------------------------------
+# Step 2: Apply edit_imgt_file.pl and build BLAST databases
+# ---------------------------------------------------------------------------
+if $SKIP_BLAST; then
+  warn "Skipping makeblastdb step (--skip_blast or tools missing)"
+else
+  header "Step 2: edit_imgt_file.pl + makeblastdb"
+
+  GAPPED_DIR="$OUTDIR/germlines/gapped"
+  FASTA_DIR="$OUTDIR/fasta"
+  DB_DIR="$OUTDIR/database"
+
+  # Helper: edit + makeblastdb for a single segment
+  build_db() {
+    local label="$1"         # e.g. IGHV
+    local gapped_in="$2"     # gapped FASTA path
+    local db_name="$3"       # output blast db name (no extension)
+
+    if [[ ! -f "$gapped_in" ]]; then
+      warn "  Skipping $label: $gapped_in not found"
+      return 0
+    fi
+
+    local fasta_out="$FASTA_DIR/${PREFIX}_${label}.fasta"
+    info "  Processing $label → $fasta_out"
+
+    if [[ -n "$EDIT_IMGT" ]]; then
+      perl "$EDIT_IMGT" "$gapped_in" > "$fasta_out"
+    else
+      # Fallback: minimal reformatting (strip dots, keep name first word)
+      awk '/^>/{sub(/ .*/,""); print} !/^>/{gsub(/\./,""); print}' \
+        "$gapped_in" > "$fasta_out"
+      warn "  edit_imgt_file.pl unavailable; used fallback reformatter for $label"
+    fi
+
+    makeblastdb \
+      -parse_seqids \
+      -dbtype nucl \
+      -in  "$fasta_out" \
+      -out "$db_dir/${PREFIX}_${label}" \
+      2>&1 | tee -a "$OUTDIR/logs/makeblastdb.log"
+
+    ok "  Built DB: $db_dir/${PREFIX}_${label}"
+  }
+
+  db_dir="$DB_DIR"
+
+  # V segments — build per-locus DBs (igblastn needs separate -germline_db_V per locus,
+  # and also a combined all-locus DB for AssignGenes.py / MakeDb.py)
+  for LOCUS in IGHV IGKV IGLV; do
+    build_db "$LOCUS" "$GAPPED_DIR/${PREFIX}_${LOCUS}.fasta" "$LOCUS"
+  done
+
+  # Combined V (for tools that accept a single V db)
+  if [[ -f "$GAPPED_DIR/${PREFIX}_ALL_V.fasta" ]]; then
+    build_db "ALL_V" "$GAPPED_DIR/${PREFIX}_ALL_V.fasta" "ALL_V"
+  fi
+
+  # D segments
+  build_db "IGHD" "$GAPPED_DIR/${PREFIX}_IGHD.fasta" "IGHD"
+
+  # J segments — per-locus and combined
+  for LOCUS in IGHJ IGKJ IGLJ; do
+    build_db "$LOCUS" "$GAPPED_DIR/${PREFIX}_${LOCUS}.fasta" "$LOCUS"
+  done
+  if [[ -f "$GAPPED_DIR/${PREFIX}_ALL_J.fasta" ]]; then
+    build_db "ALL_J" "$GAPPED_DIR/${PREFIX}_ALL_J.fasta" "ALL_J"
+  fi
+
+  # Constant regions
+  if ! $SKIP_CONSTANT && [[ -n "$REF_CONST_DIR" ]]; then
+    info "Building constant region database..."
+    CONST_FASTA="$FASTA_DIR/${PREFIX}_C.fasta"
+    : > "$CONST_FASTA"
+    for const_file in \
+        "$REF_CONST_DIR/imgt_${SPECIES}_IGHC.fasta" \
+        "$REF_CONST_DIR/imgt_${SPECIES}_IGKC.fasta" \
+        "$REF_CONST_DIR/imgt_${SPECIES}_IGLC.fasta" \
+        "$REF_CONST_DIR/"*IGHC.fasta \
+        "$REF_CONST_DIR/"*IGKC.fasta \
+        "$REF_CONST_DIR/"*IGLC.fasta; do
+      [[ -f "$const_file" ]] || continue
+      if [[ -n "$EDIT_IMGT" ]]; then
+        perl "$EDIT_IMGT" "$const_file" >> "$CONST_FASTA"
+      else
+        awk '/^>/{sub(/ .*/,""); print} !/^>/{gsub(/\./,""); print}' \
+          "$const_file" >> "$CONST_FASTA"
+      fi
+    done
+    # Deduplicate sequences by name
+    if command -v seqkit &>/dev/null; then
+      seqkit rmdup "$CONST_FASTA" -o "${CONST_FASTA}.dedup" && \
+        mv "${CONST_FASTA}.dedup" "$CONST_FASTA"
+    fi
+    if [[ -s "$CONST_FASTA" ]]; then
+      makeblastdb -parse_seqids -dbtype nucl \
+        -in  "$CONST_FASTA" \
+        -out "$db_dir/${PREFIX}_C" \
+        2>&1 | tee -a "$OUTDIR/logs/makeblastdb.log"
+      ok "Built constant region DB: $db_dir/${PREFIX}_C"
+    else
+      warn "Constant region FASTA empty; skipping DB build"
+    fi
+  fi
+
+  ok "makeblastdb step complete"
+
+  # ---------------------------------------------------------------------------
+  # Step 3: Build internal_data/<species>/ for igblastn
+  # igblastn requires: $IGDATA/internal_data/<organism>/<organism>_V (blast db)
+  #                    $IGDATA/internal_data/<organism>/<organism>.ndm.imgt
+  # The internal V/D/J dbs are SEPARATE from the search dbs -- they are used
+  # only for alignment coordinate mapping (one allele per gene is enough).
+  # We must build them fresh with makeblastdb from processed FASTA files.
+  # ---------------------------------------------------------------------------
+  header "Step 3: Build internal_data/ databases"
+  INTERNAL="$OUTDIR/internal_data/$SPECIES"
+  mkdir -p "$INTERNAL"
+
+  # Helper: process a gapped FASTA through edit_imgt_file.pl (or fallback),
+  # then build a BLAST db named <dest_base> inside $INTERNAL.
+  build_internal_db() {
+    local label="$1"       # e.g. V, D, J
+    local src_fasta="$2"   # gapped FASTA path
+    [[ -f "$src_fasta" ]] || { warn "  internal_data $label: $src_fasta not found"; return 0; }
+
+    local tmp_fasta="${INTERNAL}/${SPECIES}_${label}_raw.fasta"
+    local dest_base="${INTERNAL}/${SPECIES}_${label}"
+
+    if [[ -n "$EDIT_IMGT" ]]; then
+      perl "$EDIT_IMGT" "$src_fasta" > "$tmp_fasta"
+    else
+      awk '/^>/{sub(/ .*/,""); print} !/^>/{gsub(/\./,""); print}' \
+        "$src_fasta" > "$tmp_fasta"
+    fi
+
+    makeblastdb \
+      -parse_seqids \
+      -dbtype nucl \
+      -in  "$tmp_fasta" \
+      -out "$dest_base" \
+      >> "$OUTDIR/logs/makeblastdb.log" 2>&1 \
+      && ok "  internal_data ${SPECIES}_${label}: built" \
+      || warn "  internal_data ${SPECIES}_${label}: makeblastdb failed (check log)"
+
+    rm -f "$tmp_fasta"
+  }
+
+  # Build V (combined all-locus), D, J internal databases
+  # Prefer combined ALL_V/ALL_J; fall back to IGH locus only
+  for v_src in \
+      "$GAPPED_DIR/${PREFIX}_ALL_V.fasta" \
+      "$GAPPED_DIR/${PREFIX}_IGHV.fasta"; do
+    [[ -f "$v_src" ]] && { build_internal_db "V" "$v_src"; break; }
+  done
+
+  build_internal_db "D" "$GAPPED_DIR/${PREFIX}_IGHD.fasta"
+
+  for j_src in \
+      "$GAPPED_DIR/${PREFIX}_ALL_J.fasta" \
+      "$GAPPED_DIR/${PREFIX}_IGHJ.fasta"; do
+    [[ -f "$j_src" ]] && { build_internal_db "J" "$j_src"; break; }
+  done
+
+  # Copy ndm.imgt into internal_data (built by the R step)
+  NDM_SRC="$OUTDIR/auxiliary/${PREFIX}_${SPECIES}.ndm.imgt"
+  if [[ -f "$NDM_SRC" ]]; then
+    cp "$NDM_SRC" "${INTERNAL}/${SPECIES}.ndm.imgt"
+    ok "  internal_data ${SPECIES}.ndm.imgt: copied"
+  else
+    warn "  ndm.imgt not found at $NDM_SRC (R step may not have generated it yet)"
+  fi
+
+  # Create optional_file/ under OUTDIR for aux lookup when IGDATA=OUTDIR
+  mkdir -p "$OUTDIR/optional_file"
+  AUX_SRC_STEP3="$OUTDIR/auxiliary/${PREFIX}_${SPECIES}_hybrid_gl.aux"
+  [[ -f "$AUX_SRC_STEP3" ]] && \
+    cp "$AUX_SRC_STEP3" "$OUTDIR/optional_file/${SPECIES}_gl.aux" 2>/dev/null || true
+
+  ok "internal_data populated: $INTERNAL"
+  info "  Files in $INTERNAL:"
+  ls -1 "$INTERNAL/" 2>/dev/null | sed 's/^/    /' || true
+
+
+fi  # end if $SKIP_BLAST (Step 2 + Step 3 block)
+# ---------------------------------------------------------------------------
+# Step 4: Copy auxiliary file to IGDATA optional_file (if writable)
+# ---------------------------------------------------------------------------
+header "Step 4: Auxiliary file"
+
+AUX_SRC="$OUTDIR/auxiliary/${PREFIX}_${SPECIES}_hybrid_gl.aux"
+if [[ -f "$AUX_SRC" ]]; then
+  ok "Auxiliary file: $AUX_SRC"
+  AUX_OPT_DIR="$IGDATA/optional_file"
+  if [[ -n "$IGDATA" && -d "$AUX_OPT_DIR" && -w "$AUX_OPT_DIR" ]]; then
+    cp "$AUX_SRC" "$AUX_OPT_DIR/${PREFIX}_${SPECIES}_hybrid_gl.aux"
+    ok "Copied to IGDATA: $AUX_OPT_DIR/${PREFIX}_${SPECIES}_hybrid_gl.aux"
+  else
+    info "IGDATA optional_file not writable; pass aux path explicitly in igblastn call"
+  fi
+else
+  warn "Auxiliary file not found (R step may have failed)"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 5: Generate ready-to-use igblastn and MakeDb.py command templates
+# ---------------------------------------------------------------------------
+header "Step 5: Generating command templates"
+
+GAPPED_DIR="$OUTDIR/germlines/gapped"
+DB_DIR="$OUTDIR/database"
+AUX_FILE="$OUTDIR/auxiliary/${PREFIX}_${SPECIES}_hybrid_gl.aux"
+IGBLAST_CMD="$OUTDIR/${PREFIX}_igblast_cmd.sh"
+
+# Resolve OUTDIR to an absolute path for the generated script
+_ABS_OUTDIR="$(cd "$OUTDIR" && pwd)"
+_ABS_DB="${_ABS_OUTDIR}/database"
+_ABS_GAPPED="${_ABS_OUTDIR}/germlines/gapped"
+_ABS_AUX="${_ABS_OUTDIR}/auxiliary/${PREFIX}_${SPECIES}_hybrid_gl.aux"
+_ABS_NDM="${_ABS_OUTDIR}/auxiliary/${PREFIX}_${SPECIES}.ndm.imgt"
+
+cat > "$IGBLAST_CMD" <<'IGBLAST_EOF'
+#!/usr/bin/env bash
+# Auto-generated igblastn command script
+# Usage: bash <this_script> <query.fasta> [out_prefix] [chain: heavy|light|all]
+
+set -euo pipefail
+
+QUERY_FASTA="${1:?Usage: $0 <query.fasta> [out_prefix] [chain: heavy|light|all]}"
+OUT_PREFIX="${2:-igblast_out}"
+CHAIN="${3:-all}"    # heavy | light | all
+IGBLAST_EOF
+
+# Bake in resolved paths and species at write time
+cat >> "$IGBLAST_CMD" <<IGBLAST_EOF2
+
+# ---- Resolved paths (baked in at build time) ----
+DB_PREFIX="${_ABS_DB}/${PREFIX}"
+AUX_FILE="${_ABS_AUX}"
+NDM_FILE="${_ABS_NDM}"
+ORGANISM="${SPECIES}"
+export IGDATA="${_ABS_OUTDIR}"
+
+# ---- Optional args (set at runtime from baked-in availability) ----
+_IGHD_ARG=""
+ls "${_ABS_DB}/${PREFIX}_IGHD".n?? &>/dev/null 2>&1 && \
+    _IGHD_ARG="-germline_db_D ${_ABS_DB}/${PREFIX}_IGHD"
+_C_ARG=""
+ls "${_ABS_DB}/${PREFIX}_C".n?? &>/dev/null 2>&1 && \
+    _C_ARG="-c_region_db ${_ABS_DB}/${PREFIX}_C"
+_NDM_ARG=""
+[[ -f "\${NDM_FILE}" ]] && _NDM_ARG="-custom_internal_data \${NDM_FILE}"
+
+# ---- Pre-flight: verify required databases ----
+_missing=0
+for _db in "\${DB_PREFIX}_IGHV" "\${DB_PREFIX}_IGHJ" \
+           "\${DB_PREFIX}_IGKV" "\${DB_PREFIX}_IGKJ" \
+           "\${DB_PREFIX}_IGLV" "\${DB_PREFIX}_IGLJ"; do
+  ls "\${_db}".n?? &>/dev/null || { echo "[ERROR] Missing: \${_db}" >&2; _missing=1; }
+done
+(( _missing == 0 )) || { echo "[ERROR] Re-run build script to rebuild databases." >&2; exit 1; }
+
+# ---- Logging ----
+_LOG="\${OUT_PREFIX}_igblast_run.log"
+exec > >(tee -a "\${_LOG}") 2>&1
+
+echo "=== igblast run: \$(date) ==="
+echo "Query    : \${QUERY_FASTA}"
+echo "Prefix   : \${OUT_PREFIX}"
+echo "Chain    : \${CHAIN}"
+echo "IGDATA   : \${IGDATA}"
+echo "DB       : \${DB_PREFIX}"
+echo "AUX      : \${AUX_FILE}"
+echo "Organism : \${ORGANISM}"
+echo "NDM file : \${NDM_FILE}  \$([[ -n \${_NDM_ARG} ]] && echo '(active)' || echo '(not found - using internal)')"
+[[ -n "\${_IGHD_ARG}" ]] && echo "D db     : ${_ABS_DB}/${PREFIX}_IGHD" || echo "D db     : (none)"
+[[ -n "\${_C_ARG}"    ]] && echo "C db     : ${_ABS_DB}/${PREFIX}_C"    || echo "C db     : (none)"
+echo ""
+
+# ---- Diagnostics ----
+echo "--- internal_data/${SPECIES}/ ---"
+ls -1 "\${IGDATA}/internal_data/${SPECIES}/" 2>/dev/null | sed 's/^/  /' || echo "  (missing)"
+echo ""
+
+# ---- Helper: run igblastn with argument logging ----
+_run_igblast() {
+  local label="\$1"; shift
+  echo "--- Running \${label} ---"
+  igblastn "\$@"
+  local rc=\$?
+  [[ \$rc -ne 0 ]] && echo "  [ERROR] igblastn exited with code \${rc}" >&2
+  return \$rc
+}
+
+# ---- IGH (heavy chain, VDJ) ----
+if [[ "\${CHAIN}" == "heavy" || "\${CHAIN}" == "all" ]]; then
+  _run_igblast "IGH (AIRR outfmt 19)" \
+      -germline_db_V  "\${DB_PREFIX}_IGHV" \
+      -germline_db_J  "\${DB_PREFIX}_IGHJ" \
+      \${_IGHD_ARG} \
+      -auxiliary_data "\${AUX_FILE}" \
+      \${_C_ARG} \
+      -domain_system imgt -ig_seqtype Ig -organism \${ORGANISM} \
+      \${_NDM_ARG} \
+      -outfmt 19 \
+      -query  "\${QUERY_FASTA}" \
+      -out    "\${OUT_PREFIX}.igh.airr.tsv"
+  echo "  -> \${OUT_PREFIX}.igh.airr.tsv"
+
+  _run_igblast "IGH (fmt7 for MakeDb.py)" \
+      -germline_db_V  "\${DB_PREFIX}_IGHV" \
+      -germline_db_J  "\${DB_PREFIX}_IGHJ" \
+      \${_IGHD_ARG} \
+      -auxiliary_data "\${AUX_FILE}" \
+      \${_C_ARG} \
+      -domain_system imgt -ig_seqtype Ig -organism \${ORGANISM} \
+      \${_NDM_ARG} \
+      -outfmt '7 std qseq sseq btop' \
+      -query  "\${QUERY_FASTA}" \
+      -out    "\${OUT_PREFIX}.igh.fmt7"
+  echo "  -> \${OUT_PREFIX}.igh.fmt7"
+fi
+
+# ---- IGK (kappa light chain, VJ) ----
+if [[ "\${CHAIN}" == "light" || "\${CHAIN}" == "all" ]]; then
+  _run_igblast "IGK (AIRR outfmt 19)" \
+      -germline_db_V  "\${DB_PREFIX}_IGKV" \
+      -germline_db_J  "\${DB_PREFIX}_IGKJ" \
+      -auxiliary_data "\${AUX_FILE}" \
+      \${_C_ARG} \
+      -domain_system imgt -ig_seqtype Ig -organism \${ORGANISM} \
+      \${_NDM_ARG} \
+      -outfmt 19 \
+      -query  "\${QUERY_FASTA}" \
+      -out    "\${OUT_PREFIX}.igk.airr.tsv"
+  echo "  -> \${OUT_PREFIX}.igk.airr.tsv"
+
+# ---- IGL (lambda light chain, VJ) ----
+  _run_igblast "IGL (AIRR outfmt 19)" \
+      -germline_db_V  "\${DB_PREFIX}_IGLV" \
+      -germline_db_J  "\${DB_PREFIX}_IGLJ" \
+      -auxiliary_data "\${AUX_FILE}" \
+      \${_C_ARG} \
+      -domain_system imgt -ig_seqtype Ig -organism \${ORGANISM} \
+      \${_NDM_ARG} \
+      -outfmt 19 \
+      -query  "\${QUERY_FASTA}" \
+      -out    "\${OUT_PREFIX}.igl.airr.tsv"
+  echo "  -> \${OUT_PREFIX}.igl.airr.tsv"
+fi
+
+echo ""
+echo "=== Done: \$(date) ==="
+echo "Log: \${_LOG}"
+IGBLAST_EOF2
+chmod +x "$IGBLAST_CMD"
+ok "igblastn command template: $IGBLAST_CMD"
+ok "igblastn command template: $IGBLAST_CMD"
+
+
+# ---------------------------------------------------------------------------
+# Step 6: Generate per-chain igblast+MakeDb pipeline scripts and install script
+# ---------------------------------------------------------------------------
+header "Step 6: Generating pipeline scripts"
+
+_ABS_OUTDIR="$(cd "$OUTDIR" && pwd)"
+_ABS_DB="${_ABS_OUTDIR}/database"
+_ABS_GAPPED="${_ABS_OUTDIR}/germlines/gapped"
+_ABS_AUX="${_ABS_OUTDIR}/auxiliary/${PREFIX}_${SPECIES}_hybrid_gl.aux"
+_ABS_NDM="${_ABS_OUTDIR}/auxiliary/${PREFIX}_${SPECIES}.ndm.imgt"
+
+# ---- Helper: write a single-chain igblast+MakeDb script ----
+write_chain_script() {
+  local script_path="$1"
+  local chain_label="$2"
+  local v_db_args="$3"
+  local d_db_arg="$4"
+  local ref_fastas="$5"
+
+  # Write the script in one unquoted heredoc.
+  # Static help text that must NOT expand uses literal dollar signs (\$).
+  # Build-time values (paths, species) ARE expanded by the unquoted heredoc.
+  cat > "$script_path" <<CHAIN_SCRIPT
+#!/usr/bin/env bash
+# =============================================================================
+# ${chain_label} chain: igblastn -> MakeDb.py pipeline
+# Generated by build_hybrid_igblast_ref.sh
+# =============================================================================
+# DESCRIPTION
+#   Runs igblastn against the hybrid ${chain_label,,} chain germline databases then
+#   parses the output with MakeDb.py to produce a Change-O / AIRR database.
+#   All database paths are embedded at build time -- no configuration needed.
+#
+# USAGE
+#   bash $(basename "$script_path") <query.fasta> [out_prefix] [makedb_outdir]
+#
+# ARGUMENTS
+#   query.fasta     REQUIRED. FASTA file of BCR sequences to annotate.
+#                   Should be full-length or near-full-length V(D)J contigs.
+#
+#   out_prefix      Output file prefix (default: igblast_out).
+#                   All output files will be named <out_prefix>.*
+#
+#   makedb_outdir   Directory for MakeDb.py output (default: current dir).
+#
+# OUTPUTS
+#   <out_prefix>.${chain_label,,}.fmt7         igblastn alignment (fmt7 for MakeDb.py)
+#   <out_prefix>.${chain_label,,}.airr.tsv     igblastn AIRR-format annotation
+#   <out_prefix>.${chain_label,,}_igblast.log  Full run log
+#   <makedb_outdir>/*_db-pass.tsv              Change-O database (pass)
+#   <makedb_outdir>/*_db-fail.tsv              Sequences failing annotation
+#
+# EMBEDDED PATHS (baked in at build time)
+#   DB prefix : ${_ABS_DB}/${PREFIX}
+#   Aux file  : ${_ABS_AUX}
+#   IGDATA    : ${_ABS_OUTDIR}
+#   Organism  : ${SPECIES}
+# =============================================================================
+
+set -euo pipefail
+[[ "\${1:-}" == "-h" || "\${1:-}" == "--help" ]] && {
+  sed -n '/^# DESCRIPTION/,/^# ===/p' "\$0" | sed 's/^# \?//'; exit 0; }
+
+QUERY_FASTA="\${1:?Usage: \$0 <query.fasta> [out_prefix] [makedb_outdir]}"
+OUT_PREFIX="\${2:-igblast_out}"
+MAKEDB_OUTDIR="\${3:-.}"
+
+# Baked-in paths
+export IGDATA="${_ABS_OUTDIR}"
+DB_PREFIX="${_ABS_DB}/${PREFIX}"
+AUX_FILE="${_ABS_AUX}"
+NDM_FILE="${_ABS_NDM}"
+ORGANISM="${SPECIES}"
+
+_NDM_ARG=""
+[[ -f "\${NDM_FILE}" ]] && _NDM_ARG="-custom_internal_data \${NDM_FILE}"
+_C_ARG=""
+ls "${_ABS_DB}/${PREFIX}_C".n?? &>/dev/null 2>&1 && _C_ARG="-c_region_db ${_ABS_DB}/${PREFIX}_C"
+
+_LOG="\${OUT_PREFIX}.${chain_label,,}_igblast.log"
+exec > >(tee -a "\${_LOG}") 2>&1
+echo "=== ${chain_label} chain igblast+MakeDb: \$(date) ==="
+echo "Query  : \${QUERY_FASTA}"
+echo "Prefix : \${OUT_PREFIX}"
+echo "IGDATA : \${IGDATA}"
+echo "DB     : \${DB_PREFIX}"
+echo ""
+
+# ---- igblastn fmt7 (for MakeDb.py) ----
+echo "--- igblastn fmt7 ---"
+igblastn \\
+    ${v_db_args} \\
+    ${d_db_arg} \\
+    -auxiliary_data "\${AUX_FILE}" \\
+    \${_C_ARG} \\
+    -domain_system imgt -ig_seqtype Ig -organism \${ORGANISM} \\
+    \${_NDM_ARG} \\
+    -outfmt '7 std qseq sseq btop' \\
+    -query  "\${QUERY_FASTA}" \\
+    -out    "\${OUT_PREFIX}.${chain_label,,}.fmt7"
+echo "  -> \${OUT_PREFIX}.${chain_label,,}.fmt7"
+
+# ---- igblastn AIRR (outfmt 19) ----
+echo "--- igblastn AIRR ---"
+igblastn \\
+    ${v_db_args} \\
+    ${d_db_arg} \\
+    -auxiliary_data "\${AUX_FILE}" \\
+    \${_C_ARG} \\
+    -domain_system imgt -ig_seqtype Ig -organism \${ORGANISM} \\
+    \${_NDM_ARG} \\
+    -outfmt 19 \\
+    -query  "\${QUERY_FASTA}" \\
+    -out    "\${OUT_PREFIX}.${chain_label,,}.airr.tsv"
+echo "  -> \${OUT_PREFIX}.${chain_label,,}.airr.tsv"
+
+# ---- MakeDb.py ----
+echo "--- MakeDb.py ---"
+mkdir -p "\${MAKEDB_OUTDIR}"
+MakeDb.py igblast \\
+    -i "\${OUT_PREFIX}.${chain_label,,}.fmt7" \\
+    -s "\${QUERY_FASTA}" \\
+    -r ${ref_fastas} \\
+    --extended --failed --asis-calls --partial \\
+    --outdir "\${MAKEDB_OUTDIR}"
+echo "  -> \${MAKEDB_OUTDIR}/"
+
+echo ""
+echo "=== Done: \$(date) === Log: \${_LOG}"
+CHAIN_SCRIPT
+
+  chmod +x "$script_path"
+  ok "  $(basename "$script_path")"
+}
+# Heavy chain V/D/J db args and ref FASTAs
+_IGH_V_ARGS="-germline_db_V ${_ABS_DB}/${PREFIX}_IGHV -germline_db_J ${_ABS_DB}/${PREFIX}_IGHJ"
+_IGH_D_ARG=""
+ls "${_ABS_DB}/${PREFIX}_IGHD".n?? &>/dev/null 2>&1 && \
+    _IGH_D_ARG="-germline_db_D ${_ABS_DB}/${PREFIX}_IGHD"
+_IGH_REFS="${_ABS_GAPPED}/${PREFIX}_IGHV.fasta"
+[[ -f "${_ABS_GAPPED}/${PREFIX}_IGHD.fasta" ]] && _IGH_REFS+=" ${_ABS_GAPPED}/${PREFIX}_IGHD.fasta"
+_IGH_REFS+=" ${_ABS_GAPPED}/${PREFIX}_IGHJ.fasta"
+
+# Light chain V/J db args and ref FASTAs
+_IGL_V_ARGS="-germline_db_V ${_ABS_DB}/${PREFIX}_IGKV -germline_db_J ${_ABS_DB}/${PREFIX}_IGKJ -germline_db_V ${_ABS_DB}/${PREFIX}_IGLV -germline_db_J ${_ABS_DB}/${PREFIX}_IGLJ"
+_IGL_REFS="${_ABS_GAPPED}/${PREFIX}_IGKV.fasta ${_ABS_GAPPED}/${PREFIX}_IGKJ.fasta ${_ABS_GAPPED}/${PREFIX}_IGLV.fasta ${_ABS_GAPPED}/${PREFIX}_IGLJ.fasta"
+
+HEAVY_CMD="$OUTDIR/${PREFIX}_run_heavy.sh"
+LIGHT_CMD="$OUTDIR/${PREFIX}_run_light.sh"
+
+write_chain_script "$HEAVY_CMD" "Heavy" "$_IGH_V_ARGS" "$_IGH_D_ARG" "$_IGH_REFS"
+write_chain_script "$LIGHT_CMD" "Light" \
+    "-germline_db_V ${_ABS_DB}/${PREFIX}_IGKV -germline_db_J ${_ABS_DB}/${PREFIX}_IGKJ" \
+    "" \
+    "${_ABS_GAPPED}/${PREFIX}_IGKV.fasta ${_ABS_GAPPED}/${PREFIX}_IGKJ.fasta ${_ABS_GAPPED}/${PREFIX}_IGLV.fasta ${_ABS_GAPPED}/${PREFIX}_IGLJ.fasta"
+
+# Note: light chain script runs IGK only in igblastn; IGL requires a separate invocation.
+# Append IGL igblastn calls to the light script
+cat >> "$LIGHT_CMD" <<'IGL_PATCH_QUOTED'
+
+# ---- IGL lambda: separate igblastn calls (different V/J database) ----
+IGL_PATCH_QUOTED
+cat >> "$LIGHT_CMD" <<IGL_PATCH_BAKED
+echo "--- igblastn IGL fmt7 ---"
+igblastn \\
+    -germline_db_V  "${_ABS_DB}/${PREFIX}_IGLV" \\
+    -germline_db_J  "${_ABS_DB}/${PREFIX}_IGLJ" \\
+    -auxiliary_data "\${AUX_FILE}" \\
+    \${_C_ARG} \\
+    -domain_system imgt -ig_seqtype Ig -organism \${ORGANISM} \\
+    \${_NDM_ARG} \\
+    -outfmt '7 std qseq sseq btop' \\
+    -query  "\${QUERY_FASTA}" \\
+    -out    "\${OUT_PREFIX}.igl.fmt7"
+echo "  -> \${OUT_PREFIX}.igl.fmt7"
+echo "--- igblastn IGL AIRR ---"
+igblastn \\
+    -germline_db_V  "${_ABS_DB}/${PREFIX}_IGLV" \\
+    -germline_db_J  "${_ABS_DB}/${PREFIX}_IGLJ" \\
+    -auxiliary_data "\${AUX_FILE}" \\
+    \${_C_ARG} \\
+    -domain_system imgt -ig_seqtype Ig -organism \${ORGANISM} \\
+    \${_NDM_ARG} \\
+    -outfmt 19 \\
+    -query  "\${QUERY_FASTA}" \\
+    -out    "\${OUT_PREFIX}.igl.airr.tsv"
+echo "  -> \${OUT_PREFIX}.igl.airr.tsv"
+IGL_PATCH_BAKED
+
+# ---- Install script: copy files to an existing IGBLAST_DB without overwriting ----
+INSTALL_CMD="$OUTDIR/${PREFIX}_install_to_igdata.sh"
+cat > "$INSTALL_CMD" <<'INSTALL_EOF_QUOTED'
+#!/usr/bin/env bash
+# =============================================================================
+# Install hybrid reference into an existing IgBLAST IGDATA directory.
+# Generated by build_hybrid_igblast_ref.sh
+# =============================================================================
+#
+# DESCRIPTION
+#   Copies the hybrid reference databases, germline FASTAs, auxiliary file,
+#   and V-gene annotation (ndm.imgt) into an existing IgBLAST IGDATA
+#   directory so they can be used with -organism <name> across any tool
+#   that calls igblastn with that IGDATA (e.g. Immcantation pipelines).
+#
+#   SAFETY: This script NEVER overwrites existing files. Run with --dry-run
+#   first to review exactly what would be copied.
+#
+# USAGE
+#   bash <this_script> <IGDATA_DIR> [--dry-run]
+#
+# ARGUMENTS
+#   IGDATA_DIR   Path to your IgBLAST share directory -- the one that contains
+#                internal_data/, optional_file/, and database/ subdirectories.
+#                This is typically ~/share/igblast or the directory pointed to
+#                by your $IGDATA environment variable.
+#
+#   --dry-run    Preview what would be installed without copying any files.
+#                Strongly recommended before the first real install.
+#
+# WHAT GETS INSTALLED
+#   database/                 Hybrid BLAST databases (V, D, J per locus)
+#   database/*.fasta          Gapped germline FASTAs (for MakeDb.py -r)
+#   optional_file/            J-gene auxiliary file (CDR3 frame info)
+#   internal_data/<organism>/ V/D/J internal BLAST DBs + ndm.imgt annotation
+#
+# AFTER INSTALLATION
+#   Use these flags in igblastn:
+#     -organism      <ORGANISM>        (embedded below)
+#     -germline_db_V database/<PREFIX>_IGHV
+#     -germline_db_J database/<PREFIX>_IGHJ
+#     -germline_db_D database/<PREFIX>_IGHD
+#     -auxiliary_data optional_file/<AUX_FILENAME>
+#
+# EMBEDDED VALUES (set at build time)
+#   Organism : (see script body below)
+#   Prefix   : (see script body below)
+# =============================================================================
+
+set -euo pipefail
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  sed -n '/^# DESCRIPTION/,/^# ===.*$/p' "$0" | grep '^#' | sed 's/^# \?//'
+  exit 0
+fi
+
+IGDATA_TARGET="${1:?Usage: $0 <IGDATA_DIR> [--dry-run]}"
+DRY_RUN=false
+[[ "${2:-}" == "--dry-run" ]] && DRY_RUN=true
+
+if [[ ! -d "$IGDATA_TARGET" ]]; then
+  echo "[ERROR] IGDATA directory not found: $IGDATA_TARGET" >&2; exit 1
+fi
+
+INSTALL_EOF_QUOTED
+
+cat >> "$INSTALL_CMD" <<INSTALL_EOF_BAKED
+ORGANISM="${SPECIES}"
+PREFIX_NAME="${PREFIX}"
+SRC_DB="${_ABS_DB}"
+SRC_GAPPED="${_ABS_GAPPED}"
+SRC_AUX="${_ABS_AUX}"
+SRC_NDM="${_ABS_NDM}"
+SRC_INTERNAL="${_ABS_OUTDIR}/internal_data/${SPECIES}"
+INSTALL_EOF_BAKED
+
+cat >> "$INSTALL_CMD" <<'INSTALL_EOF_QUOTED2'
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+n_copied=0; n_skipped=0; n_would=0
+
+safe_copy() {
+  local src="$1" dest_dir="$2" dest_name="${3:-$(basename "$1")}"
+  local dest="${dest_dir}/${dest_name}"
+  [[ -f "$src" ]] || { echo -e "${YELLOW}[SKIP]${NC} source missing: $src"; return; }
+  if [[ -e "$dest" ]]; then
+    echo -e "${YELLOW}[SKIP]${NC} already exists: $dest"
+    (( n_skipped++ )) || true
+    return
+  fi
+  if $DRY_RUN; then
+    echo -e "${GREEN}[WOULD COPY]${NC} $src -> $dest"
+    (( n_would++ )) || true
+  else
+    mkdir -p "$dest_dir"
+    cp "$src" "$dest"
+    echo -e "${GREEN}[COPIED]${NC} $dest"
+    (( n_copied++ )) || true
+  fi
+}
+
+echo "=== Installing ${PREFIX_NAME} (${ORGANISM}) into ${IGDATA_TARGET} ==="
+$DRY_RUN && echo "  [DRY RUN — no files will be written]"
+echo ""
+
+# 1. Blast databases -> database/
+echo "--- Germline BLAST databases ---"
+for locus in IGHV IGHD IGHJ IGKV IGKJ IGLV IGLJ; do
+  for ext in nhr nin nsq nsi nsd nog njs nto ntf not nos ndb nal; do
+    src="${SRC_DB}/${PREFIX_NAME}_${locus}.${ext}"
+    [[ -f "$src" ]] && safe_copy "$src" "${IGDATA_TARGET}/database"
+  done
+done
+
+# 2. Gapped FASTAs -> database/ (for MakeDb.py -r)
+echo ""
+echo "--- Gapped germline FASTAs (for MakeDb.py -r) ---"
+for locus in IGHV IGHD IGHJ IGKV IGKJ IGLV IGLJ; do
+  src="${SRC_GAPPED}/${PREFIX_NAME}_${locus}.fasta"
+  [[ -f "$src" ]] && safe_copy "$src" "${IGDATA_TARGET}/database"
+done
+
+# 3. Auxiliary file -> optional_file/
+echo ""
+echo "--- Auxiliary file ---"
+safe_copy "$SRC_AUX" "${IGDATA_TARGET}/optional_file"
+
+# 4. ndm.imgt -> internal_data/<organism>/
+echo ""
+echo "--- V gene annotation (ndm.imgt) ---"
+INT_DEST="${IGDATA_TARGET}/internal_data/${ORGANISM}"
+safe_copy "$SRC_NDM" "$INT_DEST" "${ORGANISM}.ndm.imgt"
+
+# 5. internal_data V/D/J blast dbs -> internal_data/<organism>/
+echo ""
+echo "--- Internal BLAST databases (internal_data/${ORGANISM}/) ---"
+for seg in V D J; do
+  for ext in nhr nin nsq nsi nsd nog njs nto ntf not nos ndb nal; do
+    src="${SRC_INTERNAL}/${ORGANISM}_${seg}.${ext}"
+    [[ -f "$src" ]] && safe_copy "$src" "$INT_DEST"
+  done
+done
+
+echo ""
+if $DRY_RUN; then
+  echo "Dry run complete: ${n_would} files would be copied, ${n_skipped} skipped (already exist)."
+  echo "Re-run without --dry-run to install."
+else
+  echo "Install complete: ${n_copied} files copied, ${n_skipped} skipped (already exist)."
+  echo ""
+  echo "To use with igblastn:"
+  echo "  export IGDATA=${IGDATA_TARGET}"
+  echo "  igblastn -organism ${ORGANISM} -germline_db_V database/${PREFIX_NAME}_IGHV \\"
+  echo "           -germline_db_J database/${PREFIX_NAME}_IGHJ \\"
+  echo "           -germline_db_D database/${PREFIX_NAME}_IGHD \\"
+  echo "           -auxiliary_data optional_file/$(basename "$SRC_AUX") ..."
+fi
+INSTALL_EOF_QUOTED2
+
+chmod +x "$INSTALL_CMD"
+ok "  $(basename "$INSTALL_CMD")"
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+header "Build complete"
+echo ""
+echo "  Species       : $SPECIES"
+echo "  Input dir     : $INPUT_DIR"
+echo "  Output root   : $OUTDIR"
+echo "  Prefix        : $PREFIX"
+echo ""
+echo "  Key outputs:"
+echo "    Gapped FASTAs           : $OUTDIR/germlines/gapped/"
+echo "    BLAST databases         : $OUTDIR/database/"
+echo "    Aux file                : $_ABS_AUX"
+echo "    ndm.imgt                : $_ABS_NDM"
+echo "    Annotation tables       : $OUTDIR/annotations/"
+echo "    Heavy chain pipeline    : $HEAVY_CMD"
+echo "    Light chain pipeline    : $LIGHT_CMD"
+echo "    Install to IGDATA       : $INSTALL_CMD"
+echo "    Manifest                : $OUTDIR/${PREFIX}_manifest.tsv"
+echo ""
+echo "  Usage:"
+echo "    Heavy chain: bash $HEAVY_CMD <query.fasta> <out_prefix> [makedb_outdir]"
+echo "    Light chain: bash $LIGHT_CMD <query.fasta> <out_prefix> [makedb_outdir]"
+echo "    Install:     bash $INSTALL_CMD <IGDATA_DIR> [--dry-run]"
+echo ""
