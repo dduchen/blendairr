@@ -1,0 +1,44 @@
+site_name: piglet
+site_url: https://piglet.readthedocs.io
+repo_url: https://bitbucket.org/yaarilab/piglet
+edit_uri: src/master/docs/
+theme:
+  name: readthedocs
+  navigation_depth: 2
+  collapse_navigation: False
+  titles_only: False
+markdown_extensions:
+  - def_list
+  - sane_lists
+  - smarty
+  - toc:
+      baselevel: 1
+      toc_depth: 1-4
+      permalink: True
+docs_dir: 'docs'
+nav:
+  - 'About':
+    - 'Introduction': index.md
+    - 'Package Overview': topics/piglet.md
+    - 'Release Notes': news.md
+  - 'Vignettes':
+    - 'PIgLET: Program for Ig clusters': vignettes/PIgLET-vignette.md
+  - 'Help Topics':
+      - 'Allele Similarity Cluste':
+        - topics/inferAlleleClusters.md
+        - topics/ighvClust.md
+        - topics/ighvDistance.md
+        - topics/generateReferenceSet.md
+        - topics/plotAlleleCluster.md
+        - topics/artificialFRW1Germline.md
+      - 'Allele based genotype':
+        - topics/inferGenotypeAllele.md
+        - topics/assignAlleleClusters.md
+        - topics/germlineASC.md
+        - topics/recentAlleleClusters.md
+        - topics/extractASCTable.md
+        - topics/zenodoArchive.md
+      - 'Data':
+        - topics/hv_functionality.md
+        - topics/HVGERM.md
+    

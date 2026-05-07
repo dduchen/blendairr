@@ -1,0 +1,25 @@
+* installing *source* package ‘piglet’ ...
+** this is package ‘piglet’ version ‘1.2.0’
+** using staged installation
+** libs
+using C++ compiler: ‘g++ (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0’
+using C++11
+make: Nothing to be done for 'all'.
+installing to /home/ayelet/BIU Dropbox/Ayelet Peres/piglet/..Rcheck/00LOCK-piglet/00new/piglet/libs
+** R
+** data
+*** moving datasets to lazyload DB
+** inst
+** byte-compile and prepare package for lazy loading
+Warning: program compiled against libxml 210 using older 209
+** help
+*** installing help indices
+** building package indices
+** installing vignettes
+** testing if installed package can be loaded from temporary location
+Warning: program compiled against libxml 210 using older 209
+** checking absolute paths in shared objects and dynamic libraries
+** testing if installed package can be loaded from final location
+Warning: program compiled against libxml 210 using older 209
+** testing if installed package keeps a record of temporary installation path
+* DONE (piglet)

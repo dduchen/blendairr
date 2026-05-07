@@ -1,0 +1,183 @@
+---
+title: "Generating Allele Similarity Clusters (ASC) for BIOMED IGHV Reference"
+author: "Ayelet Peres & William D. Lees & Gur Yaari"
+date: "Last modified `r Sys.Date()`"
+output:
+  bookdown::html_document2:
+    base_format: rmarkdown::html_vignette
+    toc: yes
+    toc_depth: 3
+  pdf_document:
+    dev: pdf
+    fig_height: 20
+    fig_width: 15
+    highlight: pygments
+    toc: yes
+    toc_depth: 3
+    template: null
+  md_document:
+    fig_height: 20
+    fig_width: 15
+    preserve_yaml: no
+    toc: yes
+    toc_depth: 3
+always_allow_html: yes
+bibliography: bibliography.bib
+csl: ieee-with-url.csl
+link-citations: yes
+urlcolor: blue
+geometry: margin=1in
+fontsize: 11pt
+vignette: >
+  %\usepackage[utf8]{inputenc}
+  %\VignetteIndexEntry{Generating Allele Similarity Clusters (ASC) for BIOMED IGHV Reference}
+  %\VignetteEngine{knitr::rmarkdown} 
+---
+
+# Overview
+
+This tutorial demonstrates how to generate Allele Similarity Clusters (ASC) for a BIOMED-style V reference using the OGRDB IGHV reference. You will:
+
+- Infer ASC clusters
+
+- Merge with PIgLET thresholds
+
+- Output ASC-formatted references
+
+- Or load precomputed versions
+
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+suppressMessages({
+  library(data.table)
+  library(tigger)
+  library(piglet)
+})
+```
+
+1. Load and Process the Reference Sets
+
+- Load the OGRDB reference
+- Mask the FWR1 region to match BIOMED-2 library
+
+```{r, eval=FALSE}
+url <- "https://bitbucket.org/yaarilab/piglet/raw/70b7d4491e25e7197e2a94bd890ce5b6e3b506a8/data-raw/HVGERM_OGRDB.fasta"
+tmp_dest_file <- file.path(tempdir(), "HVGERM_OGRDB.fasta")
+download.file(url, tmp_dest_file, mode = "wb")
+
+ref_ogrdb <- readIgFasta(tmp_dest_file)
+
+ref_ogrdb_frw1 <- piglet::artificialFRW1Germline(ref_ogrdb)
+
+```
+
+2. Infer Allele Similarity Clusters (ASC)
+
+```{r, eval=FALSE}
+asc_frw1 <- inferAlleleClusters(ref_ogrdb_frw1)
+allele_table_frw1 <- setDT(asc_frw1@alleleClusterTable)[, .(iuis_allele, new_allele)]
+setnames(allele_table_frw1, c("allele", "asc_allele"))
+```
+
+3. Merge with Threshold Table from PIgLET
+
+```{r, eval=FALSE}
+allele_table_piglet <- fread("https://bitbucket.org/yaarilab/piglet/raw/70b7d4491e25e7197e2a94bd890ce5b6e3b506a8/data-raw/allele_threshold_table.tsv")
+
+allele_table_frw1$threshold <- 1e-04
+allele_table_frw1$threshold <- apply(allele_table_frw1, 1, function(x){
+  gene <- unlist(strsplit(x[["allele"]],"[*]"))
+  alleles <- unlist(strsplit(gene[2],"_"))
+  gene <- gene[1]
+  alleles <- paste0(gene,"*",alleles)
+  thresh <- allele_table_piglet[allele %in% alleles, sum(threshold)]
+  thresh
+})
+
+allele_table_frw1 <- rbind(
+  allele_table_frw1[,.(allele,asc_allele,threshold)],
+  allele_table_piglet[!grepl("V",allele),]
+)
+allele_table_frw1[,tag:=substr(allele, 4, 4)]
+
+```
+
+4. Load Precomputed Partial BIOMED Reference
+
+```{r, eval=FALSE}
+url <- "https://bitbucket.org/yaarilab/piglet/raw/70b7d4491e25e7197e2a94bd890ce5b6e3b506a8/data-raw/HVGERM_ogrdb_asc_partial.fasta"
+tmp_dest_file <- file.path(tempdir(), "HVGERM_ogrdb_asc_partial.fasta")
+download.file(url, tmp_dest_file, mode = "wb")
+
+asc_germline <- readIgFasta(tmp_dest_file)
+
+allele_table <- fread("https://bitbucket.org/yaarilab/piglet/raw/70b7d4491e25e7197e2a94bd890ce5b6e3b506a8/data-raw/allele_threshold_table_ogrdb_partial.tsv")
+```
+
+5. Convert Annotations to ASC format
+
+```{r, eval=FALSE}
+data <- tigger::AIRRDb
+data$v_call_or <- data$v_call
+
+allele_table_split <- allele_table[, {
+  parts <- strsplit(allele, "\\*")[[1]]
+  gene <- parts[1]
+  alleles <- strsplit(parts[2], "_")[[1]]
+  expanded <- paste0(gene, "*", alleles)
+  .(allele = expanded, asc_allele, threshold, tag)
+}, by = .I]
+
+allele_table_split[, I := NULL]
+
+asc_data <- assignAlleleClusters(data, allele_table_split, v_call = "v_call", from_col = "allele", to_col = "asc_allele")
+
+```
+
+6. Infer Genotypes
+
+```{r, eval=FALSE}
+
+# using the asc annotations
+
+asc_genotype <- inferGenotypeAllele(
+  asc_data,
+  allele_threshold_table = allele_table,
+  call = "v_call", # change to the column call you want to genotype
+  asc_annotation = TRUE, # if you use iuis names then set to FALSE
+  single_assignment = TRUE, # if you want to use the single assignment algorithm
+  find_unmutated = FALSE # change to TRUE to filter mutated reads
+  # germline_db = asc_germline # Uncomment if you want to filter mutated reads
+)
+
+# using the biomed annotations, make sure to convert the v_call to the collapsed biomed annotations
+allele_table_biomed <- allele_table
+allele_table_biomed[, asc_allele := allele]
+
+allele_table_split <- allele_table_biomed[, {
+  parts <- strsplit(allele, "\\*")[[1]]
+  gene <- parts[1]
+  alleles <- strsplit(parts[2], "_")[[1]]
+  expanded <- paste0(gene, "*", alleles)
+  .(allele = expanded, asc_allele, threshold, tag)
+}, by = .I]
+
+allele_table_split[, I := NULL]
+
+biomed_data <- assignAlleleClusters(data, allele_table_split, v_call = "v_call", from_col = "allele", to_col = "asc_allele")
+
+asc_genotype_biomed <- inferGenotypeAllele(
+  biomed_data,
+  allele_threshold_table = allele_table,
+  call = "v_call", # change to the column call you want to genotype
+  asc_annotation = FALSE, # if you use iuis names then set to FALSE
+  single_assignment = TRUE
+)
+
+```
+

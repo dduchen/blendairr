@@ -1,0 +1,637 @@
+
+R version 4.5.1 (2025-06-13) -- "Great Square Root"
+Copyright (C) 2025 The R Foundation for Statistical Computing
+Platform: x86_64-pc-linux-gnu
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+  Natural language support but running in an English locale
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+> pkgname <- "piglet"
+> source(file.path(R.home("share"), "R", "examples-header.R"))
+> options(warn = 1)
+> base::assign(".ExTimings", "piglet-Ex.timings", pos = 'CheckExEnv')
+> base::cat("name\tuser\tsystem\telapsed\n", file=base::get(".ExTimings", pos = 'CheckExEnv'))
+> base::assign(".format_ptime",
++ function(x) {
++   if(!is.na(x[4L])) x[1L] <- x[1L] + x[4L]
++   if(!is.na(x[5L])) x[2L] <- x[2L] + x[5L]
++   options(OutDec = '.')
++   format(x[1L:3L], digits = 7L)
++ },
++ pos = 'CheckExEnv')
+> 
+> ### * </HEADER>
+> library('piglet')
+Warning: program compiled against libxml 210 using older 209
+PIgLET version: 1.2.0 New feature was added! A confidence level to the genotype inference. Check the news for more details To cite package ‘piglet’ in publications use:
+
+  Peres A, Lees W, Rodriguez O, Lee N, Polak P, Hope R, Kedmi M,
+  Collins A, Ohlin M, Kleinstein S, Watson C, Yaari G (2023). “IGHV
+  allele similarity clustering improves genotype inference from
+  adaptive immune receptor repertoire sequencing data.” _Nucleic Acid
+  Research_, E86. doi:10.1093/nar/gkad603
+  <https://doi.org/10.1093/nar/gkad603>.
+
+A BibTeX entry for LaTeX users is
+
+  @Article{,
+    title = {IGHV allele similarity clustering improves genotype inference from adaptive immune receptor repertoire sequencing data},
+    author = {Ayelet Peres and William Lees and Oscar Rodriguez and Noah Lee and Pazit Polak and Ronen Hope and Meirav Kedmi and Andrew Collins and Mats Ohlin and Steven Kleinstein and Corey Watson and Gur Yaari},
+    year = {2023},
+    doi = {10.1093/nar/gkad603},
+    journal = {Nucleic Acid Research},
+    number = {51},
+    pages = {E86},
+  }
+
+
+> 
+> base::assign(".oldSearch", base::search(), pos = 'CheckExEnv')
+> base::assign(".old_wd", base::getwd(), pos = 'CheckExEnv')
+> cleanEx()
+> nameEx("allele_diff")
+> ### * allele_diff
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: allele_diff
+> ### Title: Alleles nucleotide position difference
+> ### Aliases: allele_diff
+> 
+> ### ** Examples
+> 
+> {
++ reference_allele = "AAGG"
++ sample_allele = "ATGA"
++ 
++ # setting position_threshold = 0 will return all differences
++ diff <- allele_diff(reference_allele, sample_allele)
++ # "A2T", "G4A"
++ print(diff)
++ 
++ # setting position_threshold = 3 will return the differences from position three onward
++ diff <- allele_diff(reference_allele, sample_allele, position_threshold = 3)
++ # "G4A"
++ print(diff)
++ 
++ # setting snps = FALSE will return the differences as indices
++ diff <- allele_diff(reference_allele, sample_allele, snps = FALSE)
++ # 2, 4
++ print(diff)
++ 
++ }
+[1] "A2T" "G4A"
+[1] "G4A"
+[1] 2 4
+> 
+> 
+> 
+> base::assign(".dptime", (proc.time() - get(".ptime", pos = "CheckExEnv")), pos = "CheckExEnv")
+> base::cat("allele_diff", base::get(".format_ptime", pos = 'CheckExEnv')(get(".dptime", pos = "CheckExEnv")), "\n", file=base::get(".ExTimings", pos = 'CheckExEnv'), append=TRUE, sep="\t")
+> cleanEx()
+> nameEx("allele_diff_indices")
+> ### * allele_diff_indices
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: allele_diff_indices
+> ### Title: Calculate differences between characters in columns of germs and
+> ###   return their indices as an int vector.
+> ### Aliases: allele_diff_indices
+> 
+> ### ** Examples
+> 
+> germs = c("ATCG", "ATCC") 
+> X = 3 
+> result = allele_diff_indices(germs, X)
+> # 1, 2, 3
+> 
+> 
+> 
+> base::assign(".dptime", (proc.time() - get(".ptime", pos = "CheckExEnv")), pos = "CheckExEnv")
+> base::cat("allele_diff_indices", base::get(".format_ptime", pos = 'CheckExEnv')(get(".dptime", pos = "CheckExEnv")), "\n", file=base::get(".ExTimings", pos = 'CheckExEnv'), append=TRUE, sep="\t")
+> cleanEx()
+> nameEx("allele_diff_indices_parallel2")
+> ### * allele_diff_indices_parallel2
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: allele_diff_indices_parallel2
+> ### Title: Calculate SNPs or their count for each germline-input sequence
+> ###   pair with optional parallel execution.
+> ### Aliases: allele_diff_indices_parallel2
+> 
+> ### ** Examples
+> 
+> # Example usage
+> germs <- c("ATCG", "ATCC")
+> inputs <- c("ATTG", "ATTA")
+> X <- 0
+> 
+> # Return indices of SNPs
+> result_indices <- allele_diff_indices_parallel2(germs, inputs, X, 
++ parallel = TRUE, return_count = FALSE)
+> print(result_indices)  # list(c(4), c(3, 4))
+[[1]]
+[1] 3
+
+[[2]]
+[1] 3 4
+
+> 
+> # Return counts of SNPs
+> result_counts <- allele_diff_indices_parallel2(germs, inputs, X, 
++ parallel = FALSE, return_count = TRUE)
+> print(result_counts)  # c(1, 2)
+[1] 1 2
+> 
+> 
+> 
+> 
+> base::assign(".dptime", (proc.time() - get(".ptime", pos = "CheckExEnv")), pos = "CheckExEnv")
+> base::cat("allele_diff_indices_parallel2", base::get(".format_ptime", pos = 'CheckExEnv')(get(".dptime", pos = "CheckExEnv")), "\n", file=base::get(".ExTimings", pos = 'CheckExEnv'), append=TRUE, sep="\t")
+> cleanEx()
+> nameEx("allele_diff_strings")
+> ### * allele_diff_strings
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: allele_diff_strings
+> ### Title: Calculate differences between characters in columns of germs and
+> ###   return them as a string vector.
+> ### Aliases: allele_diff_strings
+> 
+> ### ** Examples
+> 
+> germs = c("ATCG", "ATCC") 
+> X = 3 
+> result = allele_diff_strings(germs, X) 
+> # "A2T", "T3C", "C2G"
+> 
+> 
+> 
+> base::assign(".dptime", (proc.time() - get(".ptime", pos = "CheckExEnv")), pos = "CheckExEnv")
+> base::cat("allele_diff_strings", base::get(".format_ptime", pos = 'CheckExEnv')(get(".dptime", pos = "CheckExEnv")), "\n", file=base::get(".ExTimings", pos = 'CheckExEnv'), append=TRUE, sep="\t")
+> cleanEx()
+> nameEx("assignAlleleClusters")
+> ### * assignAlleleClusters
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: assignAlleleClusters
+> ### Title: Assign allele similarity clusters
+> ### Aliases: assignAlleleClusters
+> 
+> ### ** Examples
+> 
+> 
+> 
+> # preferably obtain the latest ASC cluster table
+> # asc_archive <- recentAlleleClusters(doi="10.5281/zenodo.7429773", get_file = TRUE)
+> 
+> # allele_cluster_table <- extractASCTable(archive_file = asc_archive)
+> 
+> # example allele similarity cluster table
+> data(allele_cluster_table)
+> 
+> # loading TIgGER AIRR-seq b cell data
+> data <- tigger::AIRRDb
+> 
+> asc_data <- assignAlleleClusters(data, allele_cluster_table)
+> 
+> 
+> 
+> 
+> 
+> base::assign(".dptime", (proc.time() - get(".ptime", pos = "CheckExEnv")), pos = "CheckExEnv")
+> base::cat("assignAlleleClusters", base::get(".format_ptime", pos = 'CheckExEnv')(get(".dptime", pos = "CheckExEnv")), "\n", file=base::get(".ExTimings", pos = 'CheckExEnv'), append=TRUE, sep="\t")
+> cleanEx()
+> nameEx("detect_communities_leiden")
+> ### * detect_communities_leiden
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: detect_communities_leiden
+> ### Title: Leiden community detection
+> ### Aliases: detect_communities_leiden
+> 
+> ### ** Examples
+> 
+> data(HVGERM)
+> d <- igDistance(HVGERM[1:10], method = "hamming")
+> g <- distance_to_graph(d)
+> comm <- detect_communities_leiden(g, resolution = 0.5)
+> 
+> 
+> 
+> 
+> base::assign(".dptime", (proc.time() - get(".ptime", pos = "CheckExEnv")), pos = "CheckExEnv")
+> base::cat("detect_communities_leiden", base::get(".format_ptime", pos = 'CheckExEnv')(get(".dptime", pos = "CheckExEnv")), "\n", file=base::get(".ExTimings", pos = 'CheckExEnv'), append=TRUE, sep="\t")
+> cleanEx()
+> nameEx("distance_to_graph")
+> ### * distance_to_graph
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: distance_to_graph
+> ### Title: Convert distance matrix to weighted graph
+> ### Aliases: distance_to_graph
+> 
+> ### ** Examples
+> 
+> data(HVGERM)
+> d <- igDistance(HVGERM[1:10], method = "hamming")
+> g <- distance_to_graph(d)
+> 
+> 
+> 
+> 
+> base::assign(".dptime", (proc.time() - get(".ptime", pos = "CheckExEnv")), pos = "CheckExEnv")
+> base::cat("distance_to_graph", base::get(".format_ptime", pos = 'CheckExEnv')(get(".dptime", pos = "CheckExEnv")), "\n", file=base::get(".ExTimings", pos = 'CheckExEnv'), append=TRUE, sep="\t")
+> cleanEx()
+> nameEx("extractASCTable")
+> ### * extractASCTable
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: extractASCTable
+> ### Title: Extracts the allele cluster table from the archive file.
+> ### Aliases: extractASCTable
+> 
+> ### ** Examples
+> 
+> 
+> ## No test: 
+> asc_archive <- recentAlleleClusters(doi="10.5281/zenodo.7429773", get_file = TRUE)
+Files will be downloaded to tmp directory: /tmp/RtmpaxccEk/working_dir/RtmprL1W8e
+doi supplied is not an 'all versions doi'
+for viewing all of the archive records change the doi to:10.5281/zenodo.7401189
+trying URL 'https://zenodo.org/api/records/7429773/files/yaarilab/asc_archive-v1.0.0.zip/content'
+Content type 'application/octet-stream' length 38038 bytes (37 KB)
+==================================================
+downloaded 37 KB
+
+> 
+> allele_cluster_table <- extractASCTable(archive_file = asc_archive)
+> ## End(No test)
+> 
+> 
+> 
+> 
+> 
+> base::assign(".dptime", (proc.time() - get(".ptime", pos = "CheckExEnv")), pos = "CheckExEnv")
+> base::cat("extractASCTable", base::get(".format_ptime", pos = 'CheckExEnv')(get(".dptime", pos = "CheckExEnv")), "\n", file=base::get(".ExTimings", pos = 'CheckExEnv'), append=TRUE, sep="\t")
+> cleanEx()
+> nameEx("germlineASC")
+> ### * germlineASC
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: germlineASC
+> ### Title: Converts IGHV germline set to ASC germline set.
+> ### Aliases: germlineASC
+> 
+> ### ** Examples
+> 
+> 
+> # preferably obtain the latest ASC cluster table
+> # asc_archive <- recentAlleleClusters(doi="10.5281/zenodo.7429773", get_file = TRUE)
+> 
+> # allele_cluster_table <- extractASCTable(archive_file = asc_archive)
+> 
+> data(HVGERM)
+> 
+> # example allele similarity cluster table
+> data(allele_cluster_table)
+> 
+> asc_germline <- germlineASC(allele_cluster_table, germline = HVGERM)
+> 
+> 
+> 
+> 
+> 
+> 
+> base::assign(".dptime", (proc.time() - get(".ptime", pos = "CheckExEnv")), pos = "CheckExEnv")
+> base::cat("germlineASC", base::get(".format_ptime", pos = 'CheckExEnv')(get(".dptime", pos = "CheckExEnv")), "\n", file=base::get(".ExTimings", pos = 'CheckExEnv'), append=TRUE, sep="\t")
+> cleanEx()
+> nameEx("igDistance")
+> ### * igDistance
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: igDistance
+> ### Title: Germline set alleles distance
+> ### Aliases: igDistance
+> 
+> ### ** Examples
+> 
+> data(HVGERM)
+> # Using DECIPHER method (default, for V segments)
+> d1 <- igDistance(HVGERM[1:10], method = "decipher")
+> 
+> # Using Hamming distance
+> d2 <- igDistance(HVGERM[1:10], method = "hamming")
+> 
+> # Using Levenshtein distance (good for D/J segments)
+> d3 <- igDistance(HVGERM[1:10], method = "lv")
+> 
+> 
+> 
+> 
+> base::assign(".dptime", (proc.time() - get(".ptime", pos = "CheckExEnv")), pos = "CheckExEnv")
+> base::cat("igDistance", base::get(".format_ptime", pos = 'CheckExEnv')(get(".dptime", pos = "CheckExEnv")), "\n", file=base::get(".ExTimings", pos = 'CheckExEnv'), append=TRUE, sep="\t")
+> cleanEx()
+> nameEx("inferAlleleClusters")
+> ### * inferAlleleClusters
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: inferAlleleClusters
+> ### Title: Allele similarity cluster
+> ### Aliases: inferAlleleClusters
+> 
+> ### ** Examples
+> 
+> # load the initial germline set
+> ## No test: 
+> data(HVGERM)
+> 
+> germline <- HVGERM[!grepl("^[.]", HVGERM)]
+> 
+> # Hierarchical clustering (default)
+> asc <- inferAlleleClusters(germline)
+> 
+> # Leiden community detection
+> asc_leiden <- inferAlleleClusters(germline[1:50],
++                                   clustering_method = "leiden",
++                                   target_clusters = 10)
+Optimizing resolution using silhouette score...
+> 
+> ## plotting the clusters
+> plot(asc)
+> ## End(No test)
+> 
+> 
+> 
+> base::assign(".dptime", (proc.time() - get(".ptime", pos = "CheckExEnv")), pos = "CheckExEnv")
+> base::cat("inferAlleleClusters", base::get(".format_ptime", pos = 'CheckExEnv')(get(".dptime", pos = "CheckExEnv")), "\n", file=base::get(".ExTimings", pos = 'CheckExEnv'), append=TRUE, sep="\t")
+> cleanEx()
+> nameEx("inferGenotypeAllele")
+> ### * inferGenotypeAllele
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: inferGenotypeAllele
+> ### Title: Allele based genotype inference
+> ### Aliases: inferGenotypeAllele
+> 
+> ### ** Examples
+> 
+> 
+> 
+> # loading TIgGER AIRR-seq b cell data
+> data <- tigger::AIRRDb
+> 
+> # allele threshold table
+> data(allele_threshold_table)
+> 
+> data(HVGERM)
+> 
+> # inferring the genotype
+> genotype <- inferGenotypeAllele(
++ data = data,
++ allele_threshold_table = allele_threshold_table,
++ germline_db = HVGERM, find_unmutated=TRUE)
+> 
+> # filter alleles with z_score >= 0 
+> 
+> head(genotype[genotype$z_score >= 0,])
+Key: <allele>
+       gene      allele count    depth threshold   z_score
+     <char>      <char> <num>    <num>     <num>     <num>
+1: IGHV1-18 IGHV1-18*01  1005 4738.942     1e-03  459.7163
+2:  IGHV1-2  IGHV1-2*02   664 4738.942     1e-03  302.9940
+3:  IGHV1-2  IGHV1-2*04   302 4738.942     1e-04  438.0321
+4: IGHV1-24 IGHV1-24*01   105 4738.942     1e-04  151.8468
+5:  IGHV1-3  IGHV1-3*01   226 4738.942     1e-05 1037.9557
+6: IGHV1-46 IGHV1-46*01   624 4738.942     1e-03  284.6101
+> 
+> 
+> 
+> 
+> base::assign(".dptime", (proc.time() - get(".ptime", pos = "CheckExEnv")), pos = "CheckExEnv")
+> base::cat("inferGenotypeAllele", base::get(".format_ptime", pos = 'CheckExEnv')(get(".dptime", pos = "CheckExEnv")), "\n", file=base::get(".ExTimings", pos = 'CheckExEnv'), append=TRUE, sep="\t")
+> cleanEx()
+> nameEx("inferGenotypeAllele_asc")
+> ### * inferGenotypeAllele_asc
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: inferGenotypeAllele_asc
+> ### Title: Allele similarity cluster based genotype inference Testing
+> ###   function
+> ### Aliases: inferGenotypeAllele_asc
+> 
+> ### ** Examples
+> 
+> 
+> 
+> # loading TIgGER AIRR-seq b cell data
+> data <- tigger::AIRRDb
+> 
+> # preferably obtain the latest ASC cluster table
+> # asc_archive <- recentAlleleClusters(doi="10.5281/zenodo.7429773", get_file = TRUE)
+> 
+> # allele_cluster_table <- extractASCTable(archive_file = asc_archive)
+> 
+> # example allele similarity cluster table
+> data(allele_cluster_table)
+> 
+> data(HVGERM)
+> 
+> # reforming the germline set
+> asc_germline <- germlineASC(allele_cluster_table, germline = HVGERM)
+> 
+> # assigning the ASC alleles
+> asc_data <- assignAlleleClusters(data, allele_cluster_table)
+> 
+> # inferring the genotype
+> asc_genotype <- inferGenotypeAllele_asc(
++ data = asc_data,
++ alleleClusterTable = allele_cluster_table,
++ germline_db = asc_germline, find_unmutated=TRUE)
+> 
+> 
+> 
+> 
+> base::assign(".dptime", (proc.time() - get(".ptime", pos = "CheckExEnv")), pos = "CheckExEnv")
+> base::cat("inferGenotypeAllele_asc", base::get(".format_ptime", pos = 'CheckExEnv')(get(".dptime", pos = "CheckExEnv")), "\n", file=base::get(".ExTimings", pos = 'CheckExEnv'), append=TRUE, sep="\t")
+> cleanEx()
+> nameEx("insert_gaps2_vec")
+> ### * insert_gaps2_vec
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: insert_gaps2_vec
+> ### Title: Insert gaps into an ungapped sequence based on a gapped
+> ###   reference sequence.
+> ### Aliases: insert_gaps2_vec
+> 
+> ### ** Examples
+> 
+> # Example usage
+> gapped <- c("caggtc..aact", "caggtc---aact")
+> ungapped <- c("caggtcaact", "caggtcaact")
+> 
+> # Sequential execution
+> result <- insert_gaps2_vec(gapped, ungapped, parallel = FALSE)
+> print(result)  # "caggtc..aact", "caggtc---aact"
+[1] "caggtc..aact"  "caggtc---aact"
+> 
+> # Parallel execution
+> result_parallel <- insert_gaps2_vec(gapped, ungapped, parallel = TRUE)
+> print(result_parallel)
+[1] "caggtc..aact"  "caggtc---aact"
+> 
+> 
+> 
+> 
+> base::assign(".dptime", (proc.time() - get(".ptime", pos = "CheckExEnv")), pos = "CheckExEnv")
+> base::cat("insert_gaps2_vec", base::get(".format_ptime", pos = 'CheckExEnv')(get(".dptime", pos = "CheckExEnv")), "\n", file=base::get(".ExTimings", pos = 'CheckExEnv'), append=TRUE, sep="\t")
+> cleanEx()
+> nameEx("plotCommunityNetwork")
+> ### * plotCommunityNetwork
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: plotCommunityNetwork
+> ### Title: Plot community network
+> ### Aliases: plotCommunityNetwork
+> 
+> ### ** Examples
+> 
+> ## No test: 
+> data(HVGERM)
+> asc <- inferAlleleClusters(HVGERM[1:30],
++                            clustering_method = "leiden",
++                            target_clusters = 5)
+Optimizing resolution using silhouette score...
+> plotCommunityNetwork(asc)
+> ## End(No test)
+> 
+> 
+> 
+> 
+> base::assign(".dptime", (proc.time() - get(".ptime", pos = "CheckExEnv")), pos = "CheckExEnv")
+> base::cat("plotCommunityNetwork", base::get(".format_ptime", pos = 'CheckExEnv')(get(".dptime", pos = "CheckExEnv")), "\n", file=base::get(".ExTimings", pos = 'CheckExEnv'), append=TRUE, sep="\t")
+> cleanEx()
+> nameEx("plotSilhouetteOptimization")
+> ### * plotSilhouetteOptimization
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: plotSilhouetteOptimization
+> ### Title: Plot silhouette optimization results
+> ### Aliases: plotSilhouetteOptimization
+> 
+> ### ** Examples
+> 
+> ## No test: 
+> data(HVGERM)
+> d <- igDistance(HVGERM[1:30], method = "hamming")
+> g <- distance_to_graph(d)
+> opt <- optimize_resolution(g, d, target_clusters = 5)
+> plotSilhouetteOptimization(opt)
+> ## End(No test)
+> 
+> 
+> 
+> 
+> base::assign(".dptime", (proc.time() - get(".ptime", pos = "CheckExEnv")), pos = "CheckExEnv")
+> base::cat("plotSilhouetteOptimization", base::get(".format_ptime", pos = 'CheckExEnv')(get(".dptime", pos = "CheckExEnv")), "\n", file=base::get(".ExTimings", pos = 'CheckExEnv'), append=TRUE, sep="\t")
+> cleanEx()
+> nameEx("plotTruncatedTree")
+> ### * plotTruncatedTree
+> 
+> flush(stderr()); flush(stdout())
+> 
+> base::assign(".ptime", proc.time(), pos = "CheckExEnv")
+> ### Name: plotTruncatedTree
+> ### Title: Plot truncated tree visualization
+> ### Aliases: plotTruncatedTree
+> 
+> ### ** Examples
+> 
+> ## No test: 
+> data(HVGERM)
+> asc <- inferAlleleClusters(HVGERM[1:50])
+> 
+> # Basic truncated tree
+> if (requireNamespace("ggtree", quietly = TRUE)) {
++   plotTruncatedTree(asc)
++ }
+Warning in min(x, na.rm = na.rm) :
+  no non-missing arguments to min; returning Inf
+Warning in max(x, na.rm = na.rm) :
+  no non-missing arguments to max; returning -Inf
+Warning in value[[3L]](cond) :
+  Could not add heatmap annotation: ℹ In argument: `is.na(x)`.
+Caused by error:
+! `..1` must be of size 17 or 1, not size 0.
+Error in `stat_tree()`:
+! Problem while computing aesthetics.
+ℹ Error occurred in the 1st layer.
+Caused by error:
+! object 'x' not found
+Backtrace:
+     ▆
+  1. ├─base (local) `<fn>`(x)
+  2. ├─ggplot2 (local) `print.ggplot2::ggplot`(x)
+  3. │ ├─ggplot2::ggplot_build(x)
+  4. │ └─ggplot2 (local) `ggplot_build.ggplot2::ggplot`(x)
+  5. │   └─ggplot2:::by_layer(...)
+  6. │     ├─rlang::try_fetch(...)
+  7. │     │ ├─base::tryCatch(...)
+  8. │     │ │ └─base (local) tryCatchList(expr, classes, parentenv, handlers)
+  9. │     │ │   └─base (local) tryCatchOne(expr, names, parentenv, handlers[[1L]])
+ 10. │     │ │     └─base (local) doTryCatch(return(expr), name, parentenv, handler)
+ 11. │     │ └─base::withCallingHandlers(...)
+ 12. │     └─ggplot2 (local) f(l = layers[[i]], d = data[[i]])
+ 13. │       └─l$compute_aesthetics(d, plot)
+ 14. │         └─ggplot2 (local) compute_aesthetics(..., self = self)
+ 15. │           └─ggplot2:::eval_aesthetics(aesthetics, data)
+ 16. │             └─base::lapply(aesthetics, eval_tidy, data = data, env = env)
+ 17. │               └─rlang (local) FUN(X[[i]], ...)
+ 18. └─base::.handleSimpleError(`<fn>`, "object 'x' not found", base::quote(NULL))
+ 19.   └─rlang (local) h(simpleError(msg, call))
+ 20.     └─handlers[[1L]](cnd)
+ 21.       └─cli::cli_abort(...)
+ 22.         └─rlang::abort(...)
+Execution halted

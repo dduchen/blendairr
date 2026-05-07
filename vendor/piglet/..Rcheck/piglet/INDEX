@@ -1,0 +1,59 @@
+GermlineCluster         GermlineCluster S3 Class
+HVGERM                  Human IGHV germlines
+alleleClusterNames      Allele similarity cluster naming scheme
+allele_cluster_table    Allele similarity cluster table
+allele_diff             Alleles nucleotide position difference
+allele_diff_indices     Calculate differences between characters in
+                        columns of germs and return their indices as an
+                        int vector.
+allele_diff_indices_parallel
+                        Calculate SNPs or their count for each
+                        germline-input sequence pair with optional
+                        parallel execution.
+allele_diff_indices_parallel2
+                        Calculate SNPs or their count for each
+                        germline-input sequence pair with optional
+                        parallel execution.
+allele_diff_strings     Calculate differences between characters in
+                        columns of germs and return them as a string
+                        vector.
+allele_threshold_table
+                        Allele thresholds table
+artificialFRW1Germline
+                        FWR1 artificial dataset generator
+assignAlleleClusters    Assign allele similarity clusters
+detect_communities_leiden
+                        Leiden community detection
+distance_to_graph       Convert distance matrix to weighted graph
+extractASCTable         Extracts the allele cluster table from the
+                        archive file.
+generateReferenceSet    Generate allele similarity reference set
+germlineASC             Converts IGHV germline set to ASC germline set.
+hv_functionality        Human IGHV germlines functionality description
+igClust                 Allele similarity clustering
+igDistance              Germline set alleles distance
+ighvClust               Allele similarity clustering (deprecated)
+ighvDistance            Germline set alleles distance (deprecated)
+inferAlleleClusters     Allele similarity cluster
+inferGenotypeAllele     Allele based genotype inference
+inferGenotypeAllele_asc
+                        Allele similarity cluster based genotype
+                        inference Testing function
+insert_gaps2_vec        Insert gaps into an ungapped sequence based on
+                        a gapped reference sequence.
+optimize_resolution     Optimize resolution parameter using silhouette
+                        score
+piglet                  The Program for Ig clusters (PIgLET) package
+plot.GermlineCluster    Plot method for GermlineCluster
+plotAlleleCluster       Plotting the dendrogram of the clusters
+plotClusterComparison   Compare hierarchical and Leiden clustering
+plotCommunityNetwork    Plot community network
+plotSilhouetteOptimization
+                        Plot silhouette optimization results
+plotTruncatedTree       Plot truncated tree visualization
+print.GermlineCluster   Print method for GermlineCluster
+recentAlleleClusters    Retrieving allele similarity clusters Zenodo
+                        archive
+summary.GermlineCluster
+                        Summary method for GermlineCluster
+zenodoArchive           zenodoArchive

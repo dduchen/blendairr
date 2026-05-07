@@ -1,0 +1,60 @@
+
+R version 4.5.1 (2025-06-13) -- "Great Square Root"
+Copyright (C) 2025 The R Foundation for Statistical Computing
+Platform: x86_64-pc-linux-gnu
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+> # This file is part of the testthat package setup.
+> # It runs all tests in the testthat directory.
+> 
+> library(testthat)
+> library(piglet)
+Warning: program compiled against libxml 210 using older 209
+PIgLET version: 1.2.0 New feature was added! A confidence level to the genotype inference. Check the news for more details To cite package 'piglet' in publications use:
+
+  Peres A, Lees W, Rodriguez O, Lee N, Polak P, Hope R, Kedmi M,
+  Collins A, Ohlin M, Kleinstein S, Watson C, Yaari G (2023). "IGHV
+  allele similarity clustering improves genotype inference from
+  adaptive immune receptor repertoire sequencing data." _Nucleic Acid
+  Research_, E86. doi:10.1093/nar/gkad603
+  <https://doi.org/10.1093/nar/gkad603>.
+
+A BibTeX entry for LaTeX users is
+
+  @Article{,
+    title = {IGHV allele similarity clustering improves genotype inference from adaptive immune receptor repertoire sequencing data},
+    author = {Ayelet Peres and William Lees and Oscar Rodriguez and Noah Lee and Pazit Polak and Ronen Hope and Meirav Kedmi and Andrew Collins and Mats Ohlin and Steven Kleinstein and Corey Watson and Gur Yaari},
+    year = {2023},
+    doi = {10.1093/nar/gkad603},
+    journal = {Nucleic Acid Research},
+    number = {51},
+    pages = {E86},
+  }
+
+
+> 
+> test_check("piglet")
+[ FAIL 0 | WARN 0 | SKIP 7 | PASS 67 ]
+
+══ Skipped tests (7) ═══════════════════════════════════════════════════════════
+• On CRAN (7): 'test-clustering.R:40:3', 'test-community.R:40:3',
+  'test-distance.R:4:3', 'test-inferAlleleClusters.R:4:3',
+  'test-inferAlleleClusters.R:29:3', 'test-inferAlleleClusters.R:104:3',
+  'test-plots.R:4:3'
+
+[ FAIL 0 | WARN 0 | SKIP 7 | PASS 67 ]
+> 
+> proc.time()
+   user  system elapsed 
+  9.901   0.728  10.277 
