@@ -565,11 +565,16 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
   # (a named vector mapping original name -> clean name for later reconciliation)
   ref_name_map <- setNames(ref_nms_clean, ref_nms)
   ref_names_clean <- ref_nms_clean
+  # Valid reference names: exclude any _dup sequences from being used as a
+  # reference anchor. _dup names are internal artefacts from input deduplication
+  # and should never propagate into gene-base assignments.
+  ref_names_valid <- ref_names_clean[!grepl("_dup", ref_names_clean, fixed=TRUE)]
   # Reverse map: cleaned name -> original IMGT name (preserves full subtype)
   # e.g. "IGHV1-2*01" -> "IGHV1-2*01" (unchanged if clean)
-  # or   "IGHV1*02"   -> "IGHV1_dup2" -> original was "IGHV1_dup2" (bare family)
-  # Used when recovering gene_base from dist_mat closest-ref column names.
-  rev_ref_name_map <- setNames(ref_nms, ref_nms_clean)
+  # Exclude entries where the original name is a _dup artefact — in those cases
+  # the cleaned name is preferable (it has already stripped the _dup suffix).
+  valid_orig <- ifelse(grepl("_dup", ref_nms, fixed=TRUE), ref_nms_clean, ref_nms)
+  rev_ref_name_map <- setNames(valid_orig, ref_nms_clean)
 
   # --- 2. Run PIgLET on the joint deduplicated set --------------------------
   pf_res <- run_piglet(joint_dd, trim3 = trim3, fam_thresh = fam_thresh,
@@ -674,9 +679,11 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
     }
     if (!resolved) {
       # Final fallback: adist to all reference sequences
-      ref_ug_clean <- as.character(RemoveGaps(ref_for_joint, removeGaps = "all"))
+      # Exclude _dup sequences from the adist reference pool
+      ref_joint_valid <- ref_for_joint[!grepl("_dup", names(ref_for_joint), fixed=TRUE)]
+      ref_ug_clean <- as.character(RemoveGaps(ref_joint_valid, removeGaps = "all"))
       dists        <- as.integer(adist(dc_seq, ref_ug_clean))
-      best_cleaned <- names(ref_for_joint)[which.min(dists)]
+      best_cleaned <- names(ref_joint_valid)[which.min(dists)]
       # Recover original IMGT name (with full subtype) from the reverse map
       best_ref <- if (exists("rev_ref_name_map") && best_cleaned %in% names(rev_ref_name_map))
                     rev_ref_name_map[[best_cleaned]] else best_cleaned
@@ -712,11 +719,17 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
     tbl_ref[, n_dashes := nchar(gsub("[^-]", "", sub("[*].*$", "", imgt_allele)))]
     tbl_ref[, allele_num_sort := suppressWarnings(
       as.integer(sub(".*[*]", "", imgt_allele)))]
-    cluster_ref_rep <- tbl_ref[
-      order(-n_dashes, allele_num_sort),
-      .(ref_rep = imgt_allele[1L]),
-      by = cluster_id
-    ]
+    # Exclude _dup-originated alleles from cluster representatives
+    tbl_ref_valid <- tbl_ref[!grepl("_dup", imgt_allele, fixed=TRUE)]
+    cluster_ref_rep <- if (nrow(tbl_ref_valid) > 0L) {
+      tbl_ref_valid[
+        order(-n_dashes, allele_num_sort),
+        .(ref_rep = imgt_allele[1L]),
+        by = cluster_id
+      ]
+    } else {
+      data.table(cluster_id=character(0L), ref_rep=character(0L))
+    }
     tbl_ref[, c("n_dashes", "allele_num_sort") := NULL]
   } else {
     cluster_ref_rep <- data.table(cluster_id = character(0L),
@@ -822,9 +835,13 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
       best_gene <- NULL
       if (!is.null(dist_mat) && cust_nm %in% rownames(dist_mat)) {
         row       <- dist_mat[cust_nm, , drop = TRUE]
-        ref_cols  <- names(row)[names(row) %in% ref_names_clean]
+        # Only use non-_dup reference sequences as anchors
+        ref_cols  <- names(row)[names(row) %in% ref_names_valid]
         if (length(ref_cols) > 0L) {
-          closest     <- ref_cols[which.min(row[ref_cols])]
+          # Prefer alleles with proper IMGT subtype (dash or S notation)
+          subtyped_cols <- ref_cols[grepl("[-S][0-9]", sub("[*].*$","",ref_cols))]
+          use_cols <- if (length(subtyped_cols) > 0L) subtyped_cols else ref_cols
+          closest     <- use_cols[which.min(row[use_cols])]
           # Recover original name for gene_base (cleaned may have lost subtype)
           orig_closest <- if (exists("rev_ref_name_map") && closest %in% names(rev_ref_name_map))
                             rev_ref_name_map[[closest]] else closest
@@ -835,9 +852,11 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
       if (is.null(best_gene)) {
         seq_i     <- as.character(RemoveGaps(
                        custom_gapped[cust_nm], removeGaps = "all"))
-        ref_ug    <- as.character(RemoveGaps(ref_for_joint, removeGaps = "all"))
-        dists     <- as.integer(adist(seq_i, ref_ug))
-        best_cleaned  <- names(ref_for_joint)[which.min(dists)]
+        # Exclude _dup sequences from adist reference pool
+        ref_valid2 <- ref_for_joint[!grepl("_dup", names(ref_for_joint), fixed=TRUE)]
+        ref_ug     <- as.character(RemoveGaps(ref_valid2, removeGaps = "all"))
+        dists      <- as.integer(adist(seq_i, ref_ug))
+        best_cleaned  <- names(ref_valid2)[which.min(dists)]
         orig_closest  <- if (exists("rev_ref_name_map") && best_cleaned %in% names(rev_ref_name_map))
                            rev_ref_name_map[[best_cleaned]] else best_cleaned
         best_gene <- sub("[*].*$", "", orig_closest)
@@ -847,6 +866,71 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
     }
   }
   tbl_cust[, new_allele := new_allele_final]
+
+  # --- 5b. Sanitise any remaining _dup names ----------------------------------
+  # _dup suffixes are internal deduplication markers that must NEVER appear in
+  # the final output. Any allele whose new_allele still contains "_dup" has
+  # missed the normal naming path — resolve it now via:
+  #   (1) dist_mat closest reference (preferred — same distance PIgLET used)
+  #   (2) ungapped edit distance fallback
+  # Then assign the next available allele number on that gene base.
+  dup_mask <- grepl("_dup", tbl_cust$new_allele, fixed = TRUE)
+  if (any(dup_mask)) {
+    message(sprintf(
+      "  [FIX] %s: %d allele(s) still have _dup names — resolving via distance",
+      label, sum(dup_mask)))
+    for (i in which(dup_mask)) {
+      cust_nm  <- tbl_cust$imgt_allele[i]
+      best_gene <- NULL
+
+      # (1) dist_mat lookup against reference sequences
+      if (!is.null(dist_mat) && cust_nm %in% rownames(dist_mat)) {
+        row      <- dist_mat[cust_nm, , drop = TRUE]
+        # Exclude _dup sequences from candidate references
+        ref_cols <- names(row)[names(row) %in% ref_names_valid]
+        if (length(ref_cols) > 0L) {
+          # Prefer alleles with a proper IMGT subtype name (dash or S notation)
+          # e.g. IGHV1-2*01 or IGHV1S16*01 are preferred over bare IGHV1*68
+          subtyped_cols <- ref_cols[grepl("[-S][0-9]", sub("[*].*$","",ref_cols))]
+          use_cols <- if (length(subtyped_cols) > 0L) subtyped_cols else ref_cols
+          closest      <- use_cols[which.min(row[use_cols])]
+          orig_closest <- if (exists("rev_ref_name_map") &&
+                              closest %in% names(rev_ref_name_map))
+                            rev_ref_name_map[[closest]] else closest
+          best_gene <- sub("[*].*$", "", orig_closest)
+          message(sprintf(
+            "  [FIX]   %s -> closest ref %s (dist=%.4f) -> gene base: %s",
+            cust_nm, closest, row[closest], best_gene))
+        }
+      }
+
+      # (2) ungapped edit distance fallback
+      if (is.null(best_gene)) {
+        seq_i    <- as.character(RemoveGaps(custom_gapped[cust_nm], removeGaps="all"))
+        # Exclude _dup sequences from adist reference pool
+        ref_valid  <- ref_for_joint[!grepl("_dup", names(ref_for_joint), fixed=TRUE)]
+        ref_ug     <- as.character(RemoveGaps(ref_valid, removeGaps="all"))
+        dists      <- as.integer(adist(seq_i, ref_ug))
+        best_cl    <- names(ref_valid)[which.min(dists)]
+        orig_cl    <- if (exists("rev_ref_name_map") && best_cl %in% names(rev_ref_name_map))
+                        rev_ref_name_map[[best_cl]] else best_cl
+        best_gene  <- sub("[*].*$", "", orig_cl)
+        message(sprintf("  [FIX]   %s -> adist closest ref %s -> gene base: %s",
+                        cust_nm, orig_cl, best_gene))
+      }
+
+      if (!is.null(best_gene)) {
+        new_name <- paste0(best_gene, "*", .next_allele(best_gene))
+        message(sprintf("  [FIX]   %s: '%s' -> '%s'",
+                        label, tbl_cust$new_allele[i], new_name))
+        tbl_cust$new_allele[i] <- new_name
+      } else {
+        message(sprintf("  [WARN] %s: could not resolve _dup name for '%s'",
+                        label, cust_nm))
+      }
+    }
+  }
+
   drop_cols <- intersect(c("new_allele_final","ref_rep","fam_rep"), names(tbl_cust))
   if (length(drop_cols)) tbl_cust[, (drop_cols) := NULL]
 
@@ -869,6 +953,18 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
     tbl_ref[,  ..cols ][,  source := "reference"],
     tbl_cust[, ..cols2][, source := "custom"]
   ), fill = TRUE)
+
+  # Final guard: no _dup names should ever reach the output
+  surviving_dups <- full_annot$new_allele[grepl("_dup", full_annot$new_allele,
+                                                 fixed = TRUE)]
+  if (length(surviving_dups) > 0L) {
+    message(sprintf(
+      "  [ERROR] %s: %d _dup name(s) survived into final output: %s",
+      label, length(surviving_dups),
+      paste(head(surviving_dups, 5L), collapse=", ")))
+    stop(sprintf("_dup allele names in final output for locus %s. ",
+                 "This is a bug — please report it."), label)
+  }
 
   list(renamed_custom    = renamed_custom,
        annot_table       = full_annot,

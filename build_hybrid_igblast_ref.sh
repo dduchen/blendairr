@@ -1362,18 +1362,89 @@ else
   echo -e "${YELLOW}[SKIP]${NC} reference leader_vexon/ not found: $LV_SRC"
 fi
 
-# ── 5. vdj_aa/ — copy reference files (prefix: imgt_aa_)
+# ── 5. vdj_aa/ — translate hybrid V FASTAs to amino acid
+#    Translate the actual hybrid gapped nucleotide V sequences (in-frame,
+#    frame 1, stripping gaps) to produce organism-specific AA sequences.
+#    Falls back to reference copies only if translation fails.
 echo ""
-echo "--- germlines/imgt/${ORGANISM}/vdj_aa/ (from reference) ---"
-AA_SRC="${GERMLINES_ROOT}/imgt/${REF_SPECIES}/vdj_aa"
+echo "--- germlines/imgt/${ORGANISM}/vdj_aa/ (translated from hybrid V FASTAs) ---"
 AA_DEST="${GERMLINES_ROOT}/imgt/${ORGANISM}/vdj_aa"
-if [[ -d "$AA_SRC" ]]; then
+mkdir -p "$AA_DEST"
+
+_translate_v_fasta() {
+  local src_nt="$1"    # gapped nucleotide FASTA
+  local dest_aa="$2"   # output amino acid FASTA
+  [[ -f "$src_nt" ]] || return 1
+
+  python3 - "$src_nt" "$dest_aa" << 'TRANSLATE_EOF'
+import sys, textwrap
+CODON = {
+    'TTT':'F','TTC':'F','TTA':'L','TTG':'L','CTT':'L','CTC':'L','CTA':'L','CTG':'L',
+    'ATT':'I','ATC':'I','ATA':'I','ATG':'M','GTT':'V','GTC':'V','GTA':'V','GTG':'V',
+    'TCT':'S','TCC':'S','TCA':'S','TCG':'S','CCT':'P','CCC':'P','CCA':'P','CCG':'P',
+    'ACT':'T','ACC':'T','ACA':'T','ACG':'T','GCT':'A','GCC':'A','GCA':'A','GCG':'A',
+    'TAT':'Y','TAC':'Y','TAA':'*','TAG':'*','CAT':'H','CAC':'H','CAA':'Q','CAG':'Q',
+    'AAT':'N','AAC':'N','AAA':'K','AAG':'K','GAT':'D','GAC':'D','GAA':'E','GAG':'E',
+    'TGT':'C','TGC':'C','TGA':'*','TGG':'W','CGT':'R','CGC':'R','CGA':'R','CGG':'R',
+    'AGT':'S','AGC':'S','AGA':'R','AGG':'R','GGT':'G','GGC':'G','GGA':'G','GGG':'G',
+}
+def translate(nt):
+    nt = nt.upper().replace('-','').replace('.','').replace(' ','')
+    aa = [CODON.get(nt[i:i+3],'X') for i in range(0,len(nt)-2,3)]
+    return ''.join(aa).rstrip('*') or 'X'
+with open(sys.argv[1]) as fin, open(sys.argv[2],'w') as fout:
+    name,seq = None,[]
+    for line in fin:
+        line=line.rstrip()
+        if line.startswith('>'):
+            if name and seq:
+                p=translate(''.join(seq))
+                if p!='X': fout.write(f'>{name}\n'+''.join(c+'\n' for c in textwrap.wrap(p,60)))
+            name=line[1:].split()[0]; seq=[]
+        else: seq.append(line)
+    if name and seq:
+        p=translate(''.join(seq))
+        if p!='X': fout.write(f'>{name}\n'+''.join(c+'\n' for c in textwrap.wrap(p,60)))
+TRANSLATE_EOF
+}
+
+# Source FASTAs: prefer already-installed vdj/, fall back to blendAIRR output dir
+_translated_any=false
+for locus in IGHV IGKV IGLV; do
+  src_nt="${VDJ_DEST}/imgt_${ORGANISM}_${locus}.fasta"
+  [[ -f "$src_nt" ]] || src_nt="${SRC_GAPPED}/imgt_${ORGANISM}_${locus}.fasta"
+  dest_aa="${AA_DEST}/imgt_aa_${ORGANISM}_${locus}.fasta"
+  if [[ -e "$dest_aa" ]]; then
+    echo -e "${YELLOW}[SKIP]${NC} already exists: imgt_aa_${ORGANISM}_${locus}.fasta"
+    (( n_skipped++ )) || true
+    _translated_any=true
+  elif [[ -f "$src_nt" ]]; then
+    if $DRY_RUN; then
+      echo -e "${GREEN}[WOULD TRANSLATE]${NC} ${locus}: $src_nt -> $dest_aa"
+      (( n_would++ )) || true
+    else
+      if _translate_v_fasta "$src_nt" "$dest_aa"; then
+        n_seqs=$(grep -c "^>" "$dest_aa" 2>/dev/null || echo 0)
+        echo -e "${GREEN}[TRANSLATED]${NC} imgt_aa_${ORGANISM}_${locus}.fasta (${n_seqs} seqs)"
+        (( n_copied++ )) || true
+        _translated_any=true
+      else
+        echo -e "${YELLOW}[WARN]${NC} translation failed for ${locus}"
+      fi
+    fi
+  else
+    echo -e "${YELLOW}[SKIP]${NC} source NT FASTA not found: $src_nt"
+  fi
+done
+
+# Fallback: copy reference vdj_aa for loci not translated above
+AA_SRC="${GERMLINES_ROOT}/imgt/${REF_SPECIES}/vdj_aa"
+if [[ -d "$AA_SRC" && "$_translated_any" == "false" ]]; then
+  echo "  Falling back to reference vdj_aa copies..."
   for f in "$AA_SRC"/imgt_aa_${REF_SPECIES}_*.fasta; do
     [[ -f "$f" ]] && safe_copy_renamed "$f" "$AA_DEST" \
       "imgt_aa_${REF_SPECIES}_" "imgt_aa_${ORGANISM}_"
   done
-else
-  echo -e "${YELLOW}[SKIP]${NC} reference vdj_aa/ not found: $AA_SRC"
 fi
 
 # ── 6. BLAST databases -> database/
@@ -1420,6 +1491,8 @@ _build_combined_db() {
   local found=0
   for locus in "${loci[@]}"; do
     local fa="${VDJ_SRC}/imgt_${ORGANISM}_${locus}.fasta"
+    # Fallback to blendAIRR output dir if not yet installed
+    [[ -f "$fa" ]] || fa="${SRC_GAPPED}/imgt_${ORGANISM}_${locus}.fasta"
     if [[ -f "$fa" ]]; then
       cat "$fa" >> "$tmp_merged"
       (( found++ )) || true
