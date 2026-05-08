@@ -12,26 +12,30 @@ LABEL org.opencontainers.image.title="blendAIRR" \
       org.opencontainers.image.licenses="MIT"
 
 # ---------------------------------------------------------------------------
-# 1. System dependencies
+# 1. System dependencies (all libraries needed by any R package in this image)
 # ---------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl wget ca-certificates \
         perl \
         ncbi-blast+ \
         python3 python3-pip python3-dev \
-        build-essential libcurl4-openssl-dev libssl-dev libxml2-dev \
+        build-essential pkg-config \
+        libcurl4-openssl-dev libssl-dev libxml2-dev \
         libfontconfig1-dev libharfbuzz-dev libfribidi-dev \
         libfreetype6-dev libpng-dev libtiff5-dev libjpeg-dev \
+        libwebp-dev \
+        libhdf5-dev \
+        libgit2-dev \
+        libssh2-1-dev \
+        libglpk-dev \
+        libsodium-dev \
+        pandoc \
         git \
+        emboss \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
-# 2. IgBLAST — pre-compiled binary + bundled germline databases
-#    The tarball from NCBI includes:
-#      bin/            igblastn, makeblastdb, edit_imgt_file.pl, ...
-#      internal_data/  per-organism internal BLAST dbs (includes mouse)
-#      optional_file/  J-gene aux files (mouse_gl.aux etc.)
-#      database/       (empty; user provides their own search databases)
+# 2. IgBLAST + bundled IMGT germlines (from Immcantation suite image)
 # ---------------------------------------------------------------------------
 ARG IGBLAST_VERSION=1.22.0
 RUN curl -fsSL \
@@ -40,83 +44,93 @@ RUN curl -fsSL \
     && ln -s /opt/ncbi-igblast-${IGBLAST_VERSION} /opt/igblast \
     && ln -s /opt/igblast/bin/* /usr/local/bin/
 
-# IGDATA must point to the igblast share that contains internal_data/ and optional_file/.
-# The tarball already ships these for all built-in organisms (mouse, human, etc.).
 ENV IGDATA=/opt/igblast
 
-# Download IMGT reference germlines for all built-in organisms.
-# These are the *reference* sequences blendAIRR co-clusters against —
-# NOT the user's custom sequences. Stored inside the igblast share so
-# the build script finds them at the standard path.
-RUN mkdir -p /opt/igblast/germlines && \
-    curl -fsSL \
-    "https://ftp.ncbi.nih.gov/blast/executables/igblast/release/${IGBLAST_VERSION}/database.tar.gz" \
-    | tar -xz -C /opt/igblast/ || true
-# Also fetch the IMGT germlines package shipped with igblast releases
-RUN curl -fsSL \
-    "https://ftp.ncbi.nih.gov/blast/executables/igblast/release/${IGBLAST_VERSION}/germline_database.tar.gz" \
-    | tar -xz -C /opt/igblast/ 2>/dev/null || \
-    # Fallback: clone from the igblast companion repository
-    (git clone --depth 1 \
-      https://bitbucket.org/kleinstein/immcantation /tmp/immcantation 2>/dev/null && \
-     cp -r /tmp/immcantation/igblast/germlines /opt/igblast/ 2>/dev/null && \
-     rm -rf /tmp/immcantation) || true
-
-# Download IMGT germlines directly (the canonical source blendAIRR expects).
-# Layout: germlines/imgt/<organism>/vdj/  and  germlines/imgt/<organism>/leader/
-RUN mkdir -p /opt/igblast/germlines/imgt && \
-    curl -fsSL \
-      "https://ftp.ncbi.nih.gov/blast/executables/igblast/release/${IGBLAST_VERSION}/imgt_germlines.tar.gz" \
-      | tar -xz -C /opt/igblast/germlines/ 2>/dev/null || true
-
-# Immcantation ships a reliable copy of IMGT germlines in their Docker image.
-# We copy just the germline directory from there as a definitive fallback.
 COPY --from=immcantation/suite:4.5.0 \
      /usr/local/share/germlines \
      /opt/igblast/germlines
 
+ENV IGBLAST_GERMLINES=/opt/igblast/germlines
+
 # ---------------------------------------------------------------------------
-# 3. Immcantation (Change-O / MakeDb.py)
+# 3. Immcantation Python tools (Change-O / MakeDb.py)
 # ---------------------------------------------------------------------------
 RUN pip3 install --no-cache-dir changeo presto
 
 # ---------------------------------------------------------------------------
-# 4. R packages — Bioconductor + CRAN
-#    Split into separate RUN layers so a single package failure doesn't
-#    invalidate the entire (expensive) R install cache.
+# 4. R: install pak — resolves the full dependency graph automatically,
+#    installs packages in the correct order, and handles binary vs source.
 # ---------------------------------------------------------------------------
 RUN Rscript -e "\
-  options(repos = c(CRAN = 'https://cloud.r-project.org')); \
-  install.packages(c('BiocManager','remotes','data.table','optparse','tools'), \
-                   repos='https://cloud.r-project.org', quiet=TRUE)"
-
-RUN Rscript -e "\
-  BiocManager::install(version='3.19', ask=FALSE, update=FALSE); \
-  BiocManager::install(c('Biostrings','DECIPHER'), ask=FALSE, update=FALSE)"
+  install.packages('pak', repos='https://cloud.r-project.org'); \
+  stopifnot(requireNamespace('pak', quietly=TRUE)); \
+  message('pak ', packageVersion('pak'), ' ready')"
 
 # ---------------------------------------------------------------------------
-# 5. PIgLET — from CRAN (published as of 2023, doi:10.1093/nar/gkad603)
-#    Pin to a specific version for reproducibility; update when needed.
+# 5. R: Bioconductor dependencies via pak
 # ---------------------------------------------------------------------------
-ARG PIGLET_VERSION=1.0.2
 RUN Rscript -e "\
-  message('Installing PIgLET ', '${PIGLET_VERSION}', ' from CRAN...'); \
-  install.packages('piglet', repos='https://cloud.r-project.org', \
-                   version='${PIGLET_VERSION}'); \
+  pak::pkg_install(c( \
+    'bioc::Biostrings','bioc::DECIPHER', \
+    'bioc::GenomicAlignments','bioc::GenomicRanges', \
+    'bioc::IRanges','bioc::S4Vectors', \
+    'bioc::ComplexHeatmap' \
+  ), ask=FALSE)"
+
+# ---------------------------------------------------------------------------
+# 6. R: devtools and alakazam/tigger via pak
+#    pak resolves the entire graph (fs, bslib, ragg, etc.) automatically
+# ---------------------------------------------------------------------------
+RUN Rscript -e "\
+  pak::pkg_install(c('devtools','alakazam','tigger'), ask=FALSE); \
+  stopifnot(requireNamespace('devtools', quietly=TRUE)); \
+  message('devtools ', packageVersion('devtools'), ' ready')"
+
+# ---------------------------------------------------------------------------
+# 7. R: remaining blendAIRR runtime dependencies
+# ---------------------------------------------------------------------------
+RUN Rscript -e "\
+  pak::pkg_install(c( \
+    'plotly','dplyr','ggplot2','R6','jsonlite','magrittr','dendextend', \
+    'RColorBrewer','circlize','splitstackshape','zen4R','rlang', \
+    'data.table','optparse','remotes', \
+    'Rcpp','stringdist','igraph','cluster','ape' \
+  ), ask=FALSE)"
+
+# ---------------------------------------------------------------------------
+# 8. PIgLET — copied directly from a pre-built local R library.
+#
+#    This avoids all compilation and Bitbucket auth issues.
+#    The compiled package (including piglet.so) is copied verbatim into
+#    the image's R site-library.
+#
+#    How to prepare vendor/piglet-built/:
+#      # On your local machine (where piglet is already installed):
+#      Rscript -e ".libPaths()"           # note your R library path
+#      cp -r <R_LIB_PATH>/piglet vendor/piglet-built
+#      git add vendor/piglet-built
+#      git commit -m "vendor pre-built piglet from local R library"
+#
+#    To update piglet: reinstall locally, repeat the cp above.
+# ---------------------------------------------------------------------------
+COPY vendor/piglet-built /usr/local/lib/R/site-library/piglet
+
+RUN Rscript -e "\
   library(piglet); \
   message('PIgLET OK: ', packageVersion('piglet'))"
 
 # ---------------------------------------------------------------------------
-# 6. Verify all dependencies load before shipping the image
+# 9. Verify all required packages load
 # ---------------------------------------------------------------------------
 RUN Rscript -e "\
-  pkgs <- c('piglet','Biostrings','DECIPHER','data.table','optparse'); \
+  pkgs <- c('piglet','Biostrings','DECIPHER','data.table','optparse', \
+            'alakazam','tigger','devtools'); \
   missing <- pkgs[!sapply(pkgs, requireNamespace, quietly=TRUE)]; \
-  if (length(missing)) stop('Missing R packages: ', paste(missing, collapse=', ')); \
+  if (length(missing)) stop('Missing: ', paste(missing, collapse=', ')); \
   message('All R packages OK')"
 
 # ---------------------------------------------------------------------------
-# 7. Install blendAIRR tool scripts
+# 10. Install blendAIRR scripts
 # ---------------------------------------------------------------------------
 COPY build_hybrid_igblast_ref.sh   /usr/local/bin/build_hybrid_igblast_ref
 COPY R/piglet_annotate_and_build.R /opt/blendAIRR/R/piglet_annotate_and_build.R
@@ -125,19 +139,15 @@ RUN chmod +x /usr/local/bin/build_hybrid_igblast_ref
 
 ENV HYBRID_IGBLAST_R_SCRIPT=/opt/blendAIRR/R/piglet_annotate_and_build.R
 
-# Point the build script to the reference germlines inside the image.
-# blendAIRR will look for: $IGBLAST_GERMLINES/imgt/<species>/vdj/
-ENV IGBLAST_GERMLINES=/opt/igblast/germlines
-
 # ---------------------------------------------------------------------------
-# 8. Final smoke-test: confirm igblastn + R + germlines are all accessible
+# 11. Final smoke-test
 # ---------------------------------------------------------------------------
 RUN igblastn -version && \
     Rscript -e "library(piglet); cat('piglet', as.character(packageVersion('piglet')), '\n')" && \
-    ls /opt/igblast/germlines/imgt/ | head -5
+    ls /opt/igblast/germlines/imgt/ | head -3
 
 # ---------------------------------------------------------------------------
-# 9. Entry point
+# 12. Entry point
 # ---------------------------------------------------------------------------
 WORKDIR /data
 

@@ -6,9 +6,13 @@ TAG          ?= local
 REGISTRY     ?= ghcr.io/dduchen
 DATA_DIR     ?= $(PWD)/data
 IGBLAST_VER  ?= 1.22.0
-PIGLET_COMMIT ?= HEAD
 
-.PHONY: build test run push singularity clean help
+.PHONY: build test run push singularity clean vendor help
+
+vendor:
+	@echo "Vendoring pre-built PIgLET from local R library..."
+	bash vendor_piglet.sh
+	@echo "Now run: git add vendor/piglet-built && git commit -m 'vendor pre-built piglet'"
 
 help:
 	@echo ""
@@ -20,6 +24,7 @@ help:
 	@echo "  push           Tag and push to $(REGISTRY)"
 	@echo "  singularity    Convert local Docker image to a Singularity .sif file"
 	@echo "  clean          Remove local image"
+	@echo "  vendor         Clone PIgLET source into vendor/ (run before first build)"
 	@echo ""
 	@echo "  Variables (override on command line):"
 	@echo "    DATA_DIR=$(DATA_DIR)"

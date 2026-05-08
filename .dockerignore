@@ -1,0 +1,13 @@
+# blendAIRR .dockerignore
+# vendor/piglet-built/ must NOT be ignored — Docker copies it into the image
+# vendor/piglet/       is not used by the current Dockerfile
+.git/
+.github/
+*.md
+docs/
+*.log
+*.tsv
+*.fasta
+newdir/
+data/
+vendor/piglet/

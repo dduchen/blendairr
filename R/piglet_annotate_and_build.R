@@ -63,7 +63,9 @@ option_list <- list(
   make_option("--v_trim3prime",             type = "integer", default = 318),
   make_option("--j_trim3prime",             type = "integer", default = 40),
   make_option("--use_asc",                  action = "store_true", default = FALSE,
-              help = "Use PIgLET ASC names (IGHVFx-Gy*01) instead of IMGT-style names")
+              help = "Use PIgLET ASC names (IGHVFx-Gy*01) instead of IMGT-style names"),
+  make_option("--organism",                 type = "character",    default = NULL,
+              help = "Organism name used as output file prefix (default: <prefix>_<species>)")
 )
 opt <- parse_args(OptionParser(option_list = option_list))
 for (req in c("custom_dir","ref_dir","outdir","igdata"))
@@ -82,6 +84,18 @@ cat("\n=== Hybrid IgBLAST Reference Builder ===\n")
 cat(sprintf("Custom dir : %s\n", opt$custom_dir))
 cat(sprintf("Reference  : %s  species=%s\n", opt$ref_dir, opt$species))
 cat(sprintf("Naming mode: %s\n", if (isTRUE(opt$use_asc)) "ASC (PIgLET cluster names)" else "IMGT (reference-based)"))
+
+# file_prefix: used for ALL output file names (FASTAs, databases, aux, ndm.imgt).
+# Defaults to <prefix>_<species> (e.g. "hybrid_mouse") for consistency with the
+# bash script's ORGANISM variable. Can be overridden with --organism.
+file_prefix <- ifelse(!is.null(opt$organism) && nchar(trimws(opt$organism)) > 0,
+                      opt$organism,
+                      paste0(opt$prefix, "_", opt$species))
+# imgt_file_prefix: used for gapped FASTA filenames to match Immcantation convention
+# e.g. imgt_hybrid_mouse_IGHV.fasta  (mirrors imgt_mouse_IGHV.fasta in reference)
+imgt_file_prefix <- paste0("imgt_", file_prefix)
+cat(sprintf("File prefix: %s  (gapped FASTAs: %s_*.fasta)\n\n",
+            file_prefix, imgt_file_prefix))
 cat(sprintf("Output     : %s\n\n", opt$outdir))
 
 # =============================================================================
@@ -1057,7 +1071,7 @@ debug_script_path <- file.path(opt$outdir, paste0(opt$prefix, "_debug_session.R"
   for (nm in c("IGHV","IGKV","IGLV","IGHJ","IGKJ","IGLJ","IGHD")) {
     lines <- c(lines,
       sprintf('# hybrid_%s <- readDNAStringSet("%s")', nm,
-              file.path(gapped_dir_d, paste0(opt$prefix,"_",nm,".fasta")))
+              file.path(gapped_dir_d, paste0(imgt_file_prefix,"_",nm,".fasta")))
     )
   }
 
@@ -1436,7 +1450,7 @@ for (nm in c("IGHV","IGKV","IGLV")) {
     pn$name_map$locus <- nm
     all_post_norm_maps[[nm]] <- pn$name_map
   }
-  write_fasta(pn$seqs, file.path(gapped_dir, paste0(opt$prefix,"_",nm,".fasta")))
+  write_fasta(pn$seqs, file.path(gapped_dir, paste0(imgt_file_prefix,"_",nm,".fasta")))
 }
 for (nm in c("IGHJ","IGKJ","IGLJ")) {
   pn <- post_normalise_seqs(J_results[[nm]]$hybrid_gapped, label = nm, use_asc = isTRUE(opt$use_asc))
@@ -1445,7 +1459,7 @@ for (nm in c("IGHJ","IGKJ","IGLJ")) {
     pn$name_map$locus <- nm
     all_post_norm_maps[[nm]] <- pn$name_map
   }
-  write_fasta(pn$seqs, file.path(gapped_dir, paste0(opt$prefix,"_",nm,".fasta")))
+  write_fasta(pn$seqs, file.path(gapped_dir, paste0(imgt_file_prefix,"_",nm,".fasta")))
 }
 {
   pn_d    <- post_normalise_seqs(D_gapped, label = "IGHD", use_asc = isTRUE(opt$use_asc))
@@ -1454,7 +1468,7 @@ for (nm in c("IGHJ","IGKJ","IGLJ")) {
     pn_d$name_map$locus <- "IGHD"
     all_post_norm_maps[["IGHD"]] <- pn_d$name_map
   }
-  write_fasta(D_gapped, file.path(gapped_dir, paste0(opt$prefix,"_IGHD.fasta")))
+  write_fasta(D_gapped, file.path(gapped_dir, paste0(imgt_file_prefix,"_IGHD.fasta")))
 }
 
 # Write the final name map: original raw header -> final sequence name in FASTA.
@@ -1481,24 +1495,24 @@ if (length(all_post_norm_maps) > 0L) {
 
 combined_V <- do.call(c, Filter(Negate(is.null),
   lapply(c("IGHV","IGKV","IGLV"), function(nm) V_results[[nm]]$hybrid_gapped)))
-write_fasta(combined_V, file.path(gapped_dir, paste0(opt$prefix,"_ALL_V.fasta")))
+write_fasta(combined_V, file.path(gapped_dir, paste0(imgt_file_prefix,"_ALL_V.fasta")))
 
 combined_J <- do.call(c, Filter(Negate(is.null),
   lapply(c("IGHJ","IGKJ","IGLJ"), function(nm) J_results[[nm]]$hybrid_gapped)))
-write_fasta(combined_J, file.path(gapped_dir, paste0(opt$prefix,"_ALL_J.fasta")))
+write_fasta(combined_J, file.path(gapped_dir, paste0(imgt_file_prefix,"_ALL_J.fasta")))
 
 cat("\n--- Writing ungapped FASTAs ---\n")
 for (nm in c("IGHV","IGKV","IGLV"))
   write_fasta(V_results[[nm]]$hybrid_ungapped,
-              file.path(ungapped_dir, paste0(opt$prefix,"_",nm,".fasta")))
+              file.path(ungapped_dir, paste0(file_prefix,"_",nm,".fasta")))
 for (nm in c("IGHJ","IGKJ","IGLJ")) {
   hg <- J_results[[nm]]$hybrid_gapped
   if (!is.null(hg))
     write_fasta(ungap(hg),
-                file.path(ungapped_dir, paste0(opt$prefix,"_",nm,".fasta")))
+                file.path(ungapped_dir, paste0(file_prefix,"_",nm,".fasta")))
 }
 write_fasta(ungap(D_gapped),
-            file.path(ungapped_dir, paste0(opt$prefix,"_IGHD.fasta")))
+            file.path(ungapped_dir, paste0(file_prefix,"_IGHD.fasta")))
 
 # =============================================================================
 # SECTION 10 -- IgBLAST auxiliary file (.aux)
@@ -1669,7 +1683,7 @@ if (nrow(aux_rows) > 0L) {
     cat(sprintf("    %-22s : %d\n", ms$anchor_method[i], ms$N[i]))
 }
 aux_path <- file.path(opt$outdir, "auxiliary",
-                      paste0(opt$prefix,"_",opt$species,"_hybrid_gl.aux"))
+                      paste0(file_prefix,"_gl.aux"))
 # Write in IgBLAST 5-field format:
 # gene | frame_offset | chain_type | cdr3_stop (1-based) | extra_bps
 chain_type_map <- c(IGH = "JH", IGK = "JK", IGL = "JL")
@@ -1837,11 +1851,11 @@ ndm_rows <- rbindlist(list(
 ), fill = TRUE)
 
 ndm_path <- file.path(opt$outdir, "auxiliary",
-                      paste0(opt$prefix, "_", opt$species, ".ndm.imgt"))
+                      paste0(file_prefix, ".ndm.imgt"))
 
 # Define int_ndm path unconditionally (used in validation block below)
 int_dir <- file.path(opt$outdir, "internal_data", opt$species)
-int_ndm <- file.path(int_dir, paste0(opt$species, ".ndm.imgt"))
+int_ndm <- file.path(int_dir, paste0(file_prefix, ".ndm.imgt"))
 
 if (nrow(ndm_rows) > 0L) {
   # Coerce position columns to integer; clamp any remaining NAs to -1
@@ -1965,22 +1979,22 @@ manifest <- data.table(
   ),
   path = c(
     header_map_out, annot_out, prov_out, debug_script_path,
-    file.path(gapped_dir, paste0(opt$prefix,"_ALL_V.fasta")),
-    file.path(gapped_dir, paste0(opt$prefix,"_IGHV.fasta")),
-    file.path(gapped_dir, paste0(opt$prefix,"_IGKV.fasta")),
-    file.path(gapped_dir, paste0(opt$prefix,"_IGLV.fasta")),
-    file.path(gapped_dir, paste0(opt$prefix,"_ALL_J.fasta")),
-    file.path(gapped_dir, paste0(opt$prefix,"_IGHJ.fasta")),
-    file.path(gapped_dir, paste0(opt$prefix,"_IGKJ.fasta")),
-    file.path(gapped_dir, paste0(opt$prefix,"_IGLJ.fasta")),
-    file.path(gapped_dir, paste0(opt$prefix,"_IGHD.fasta")),
-    file.path(ungapped_dir, paste0(opt$prefix,"_IGHV.fasta")),
-    file.path(ungapped_dir, paste0(opt$prefix,"_IGKV.fasta")),
-    file.path(ungapped_dir, paste0(opt$prefix,"_IGLV.fasta")),
-    file.path(ungapped_dir, paste0(opt$prefix,"_IGHJ.fasta")),
-    file.path(ungapped_dir, paste0(opt$prefix,"_IGKJ.fasta")),
-    file.path(ungapped_dir, paste0(opt$prefix,"_IGLJ.fasta")),
-    file.path(ungapped_dir, paste0(opt$prefix,"_IGHD.fasta")),
+    file.path(gapped_dir, paste0(imgt_file_prefix,"_ALL_V.fasta")),
+    file.path(gapped_dir, paste0(imgt_file_prefix,"_IGHV.fasta")),
+    file.path(gapped_dir, paste0(imgt_file_prefix,"_IGKV.fasta")),
+    file.path(gapped_dir, paste0(imgt_file_prefix,"_IGLV.fasta")),
+    file.path(gapped_dir, paste0(imgt_file_prefix,"_ALL_J.fasta")),
+    file.path(gapped_dir, paste0(imgt_file_prefix,"_IGHJ.fasta")),
+    file.path(gapped_dir, paste0(imgt_file_prefix,"_IGKJ.fasta")),
+    file.path(gapped_dir, paste0(imgt_file_prefix,"_IGLJ.fasta")),
+    file.path(gapped_dir, paste0(imgt_file_prefix,"_IGHD.fasta")),
+    file.path(ungapped_dir, paste0(file_prefix,"_IGHV.fasta")),
+    file.path(ungapped_dir, paste0(file_prefix,"_IGKV.fasta")),
+    file.path(ungapped_dir, paste0(file_prefix,"_IGLV.fasta")),
+    file.path(ungapped_dir, paste0(file_prefix,"_IGHJ.fasta")),
+    file.path(ungapped_dir, paste0(file_prefix,"_IGKJ.fasta")),
+    file.path(ungapped_dir, paste0(file_prefix,"_IGLJ.fasta")),
+    file.path(ungapped_dir, paste0(file_prefix,"_IGHD.fasta")),
     aux_path, paste0(aux_path,".diagnostic")
   )
 )

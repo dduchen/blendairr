@@ -1,0 +1,23 @@
+# blendAIRR .gitignore
+
+# Docker build artifacts
+*.log
+
+# Local test data
+data/
+newdir/
+*.airr.tsv
+*.fmt7
+
+# R artifacts
+.Rhistory
+.RData
+*.Rproj
+
+# Editor
+.DS_Store
+*.swp
+
+# vendor/piglet-built/ is intentionally committed (pre-built PIgLET package)
+# vendor/piglet/       is the old source-based approach — no longer used
+vendor/piglet/
