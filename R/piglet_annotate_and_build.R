@@ -65,7 +65,9 @@ option_list <- list(
   make_option("--use_asc",                  action = "store_true", default = FALSE,
               help = "Use PIgLET ASC names (IGHVFx-Gy*01) instead of IMGT-style names"),
   make_option("--organism",                 type = "character",    default = NULL,
-              help = "Organism name used as output file prefix (default: <prefix>_<species>)")
+              help = "Organism name used as output file prefix (default: <prefix>_<species>)"),
+  make_option("--as_is_ids",                action = "store_true", default = FALSE,
+              help = "Accept input allele names as-is; skip PIgLET clustering entirely. Duplicate names get _1, _2 suffix. Sequence-level deduplication still applied.")
 )
 opt <- parse_args(OptionParser(option_list = option_list))
 for (req in c("custom_dir","ref_dir","outdir","igdata"))
@@ -96,6 +98,347 @@ file_prefix <- ifelse(!is.null(opt$organism) && nchar(trimws(opt$organism)) > 0,
 imgt_file_prefix <- paste0("imgt_", file_prefix)
 cat(sprintf("File prefix: %s  (gapped FASTAs: %s_*.fasta)\n\n",
             file_prefix, imgt_file_prefix))
+
+# If --as_is_ids, run the lightweight pipeline and exit early
+if (isTRUE(opt$as_is_ids)) {
+  # Helper: truncate names to BLAST's 50-char local id limit
+  .truncate_id <- function(nm, max_len = 50L) {
+    ifelse(nchar(nm) > max_len, substr(nm, 1L, max_len), nm)
+  }
+
+  # Helper: deduplicate names with _1, _2 suffix
+  .dedup_names <- function(nms) {
+    suffix_count <- list()
+    for (i in seq_along(nms)) {
+      nm <- nms[i]
+      if (!is.null(suffix_count[[nm]])) {
+        nms[i] <- paste0(nm, "_", suffix_count[[nm]])
+        suffix_count[[nm]] <- suffix_count[[nm]] + 1L
+      } else {
+        suffix_count[[nm]] <- 1L
+      }
+    }
+    nms
+  }
+
+  source_as_is <- function() {
+    cat("\n=== as-is-ids mode: input names used directly, merged with reference ===\n")
+    cat(sprintf("Input dir  : %s\n", opt$custom_dir))
+    cat(sprintf("Ref dir    : %s\n", opt$ref_dir))
+    cat(sprintf("Organism   : %s\n", file_prefix))
+
+    loci <- c("IGHV","IGHD","IGHJ","IGKV","IGKJ","IGLV","IGLJ")
+
+    for (locus in loci) {
+      # ── Find custom input FASTA ────────────────────────────────────────
+      chain_sub <- if (startsWith(locus, "IGH")) "heavy" else "light"
+      cust_fa   <- Filter(file.exists, c(
+        file.path(opt$custom_dir, chain_sub, paste0(locus, ".fasta")),
+        file.path(opt$custom_dir, paste0(locus, ".fasta"))))[1L]
+
+      # ── Find reference FASTA ───────────────────────────────────────────
+      ref_fa <- Filter(file.exists, c(
+        file.path(opt$ref_dir, paste0("imgt_", opt$species, "_", locus, ".fasta")),
+        file.path(opt$ref_dir, paste0(opt$species, "_", locus, ".fasta")),
+        file.path(opt$ref_dir, paste0(locus, ".fasta"))))[1L]
+
+      # Skip locus if neither custom nor reference exists
+      if (is.na(cust_fa) && is.na(ref_fa)) {
+        cat(sprintf("  [SKIP] %s: no custom or reference FASTA found\n", locus)); next
+      }
+
+      # ── Load and merge: custom first, then reference ───────────────────
+      cust_seqs <- if (!is.na(cust_fa))
+        Biostrings::readDNAStringSet(cust_fa) else Biostrings::DNAStringSet()
+      ref_seqs  <- if (!is.na(ref_fa))
+        Biostrings::readDNAStringSet(ref_fa)  else Biostrings::DNAStringSet()
+
+      n_cust <- length(cust_seqs); n_ref <- length(ref_seqs)
+      seqs   <- c(cust_seqs, ref_seqs)
+      n_raw  <- length(seqs)
+
+      cat(sprintf("  %s: %d custom + %d reference = %d total\n",
+                  locus, n_cust, n_ref, n_raw))
+
+      if (n_raw == 0L) { cat(sprintf("  [SKIP] %s: empty after merge\n", locus)); next }
+
+      # ── Step 1: parse and normalise FASTA headers ──────────────────────
+      # Three header formats are handled:
+      #   (a) IMGT pipe-delimited: acc|GENE*ALLELE|Species_strain|func|...
+      #       -> GENE*ALLELE_strain  e.g. IGHV1-18-28*01_BALB/cJ
+      #   (b) Plain allele with tag: GENE*ALLELE_tag  (kept as-is)
+      #   (c) Plain allele: GENE*ALLELE               (kept as-is)
+      # All names are truncated to the BLAST 50-char local id limit after parsing.
+      .parse_imgt_header <- function(h) {
+        h <- sub("\\s.*$", "", h)   # strip trailing description first
+        if (grepl("|", h, fixed = TRUE)) {
+          parts <- strsplit(h, "\\|")[[1L]]
+          gene_allele <- if (length(parts) >= 2L) parts[2L] else h
+          strain <- ""
+          if (length(parts) >= 3L) {
+            sp_parts <- strsplit(parts[3L], "_")[[1L]]
+            if (length(sp_parts) >= 3L) {
+              strain <- paste(sp_parts[seq(3L, length(sp_parts))], collapse="_")
+            } else if (length(sp_parts) == 2L) {
+              strain <- sp_parts[2L]
+            }
+          }
+          if (nchar(strain) > 0L) paste0(gene_allele, "_", strain) else gene_allele
+        } else {
+          h   # plain format — keep as-is
+        }
+      }
+      nms <- vapply(names(seqs), .parse_imgt_header, character(1L),
+                    USE.NAMES = FALSE)
+      too_long <- nchar(nms) > 50L
+      if (any(too_long)) {
+        cat(sprintf("  [WARN] %s: %d name(s) exceed 50 chars and will be truncated\n",
+                    locus, sum(too_long)))
+        nms <- .truncate_id(nms)
+      }
+      names(seqs) <- nms
+
+      # ── Step 2: sequence-level deduplication (custom seqs take priority) ──
+      seqs_char <- as.character(seqs)
+      keep_seq  <- !duplicated(seqs_char)
+      n_seq_dup <- sum(!keep_seq)
+      if (n_seq_dup > 0L) {
+        cat(sprintf("  [DEDUP-seq]  %s: %d duplicate sequence(s) removed\n",
+                    locus, n_seq_dup))
+        seqs <- seqs[keep_seq]
+        nms  <- names(seqs)
+      }
+
+      # ── Step 3: name-level deduplication ──────────────────────────────
+      n_name_dup <- sum(duplicated(nms))
+      if (n_name_dup > 0L) {
+        nms <- .dedup_names(nms)
+        names(seqs) <- nms
+        cat(sprintf("  [DEDUP-name] %s: %d duplicate name(s) suffixed _1, _2 ...\n",
+                    locus, n_name_dup))
+      }
+
+      cat(sprintf("  [OK] %s: %d final unique sequences\n", locus, length(seqs)))
+
+      # ── Write gapped FASTA ─────────────────────────────────────────────
+      gapped_dir <- file.path(opt$outdir, "germlines", "gapped")
+      dir.create(gapped_dir, recursive=TRUE, showWarnings=FALSE)
+      out_fa <- file.path(gapped_dir, paste0(imgt_file_prefix, "_", locus, ".fasta"))
+      Biostrings::writeXStringSet(seqs, out_fa)
+    }
+    cat("\n=== as-is-ids annotation complete ===\n")
+
+    # ── Build aux file from as-is J gene sequences ──────────────────────
+    cat("\n--- Building auxiliary file (as-is-ids mode) ---\n")
+    aux_dir <- file.path(opt$outdir, "auxiliary")
+    dir.create(aux_dir, recursive=TRUE, showWarnings=FALSE)
+    aux_path_ai <- file.path(aux_dir, paste0(file_prefix, "_gl.aux"))
+
+    # Load reference aux for anchor lookup
+    ref_aux_dt_ai <- NULL
+    for (cand in c(
+        file.path(opt$igdata, "optional_file", paste0(opt$species, "_gl.aux")),
+        file.path(opt$igdata, "optional_file", paste0(opt$species, ".aux")))) {
+      if (file.exists(cand)) {
+        aux_raw <- readLines(cand)
+        aux_data <- aux_raw[!grepl("^\\s*#", aux_raw) & nchar(trimws(aux_raw)) > 0L]
+        aux_split <- strsplit(trimws(aux_data), "\\s+")
+        aux_rows_ok <- aux_split[sapply(aux_split, length) == 5L]
+        if (length(aux_rows_ok) > 0L) {
+          ref_aux_dt_ai <- as.data.table(do.call(rbind, aux_rows_ok))
+          setnames(ref_aux_dt_ai, c("gene","frame","chain_type","cdr3_stop","extra_bps"))
+          ref_aux_dt_ai[, c("frame","cdr3_stop","extra_bps") :=
+            .(as.integer(frame), as.integer(cdr3_stop), as.integer(extra_bps))]
+          cat(sprintf("  Loaded reference aux: %s (%d entries)\n",
+                      cand, nrow(ref_aux_dt_ai)))
+          break
+        }
+      }
+    }
+
+    con_aux <- file(aux_path_ai, open="wt")
+    writeLines(c(
+      "#gene/allele name, first coding frame start position, chain type, CDR3 stop, extra bps beyond J coding end.",
+      "#All positions are 0-based", ""), con_aux)
+
+    # Copy legacy short names from reference
+    if (!is.null(ref_aux_dt_ai)) {
+      legacy_ai <- ref_aux_dt_ai[!grepl("\\*", gene) & grepl("^J[HKLA-Z]\\d", gene)]
+      for (r in seq_len(nrow(legacy_ai)))
+        writeLines(paste(legacy_ai$gene[r], legacy_ai$frame[r], legacy_ai$chain_type[r],
+                         legacy_ai$cdr3_stop[r], legacy_ai$extra_bps[r], sep="\t"), con_aux)
+      if (nrow(legacy_ai)) writeLines("", con_aux)
+    }
+
+    chain_map_ai <- c(IGH="JH", IGK="JK", IGL="JL")
+    for (j_locus in c("IGHJ","IGKJ","IGLJ")) {
+      j_fa <- Filter(file.exists, c(
+        file.path(opt$outdir, "germlines", "gapped",
+                  paste0(imgt_file_prefix, "_", j_locus, ".fasta"))))[1L]
+      if (is.na(j_fa)) next
+      j_seqs <- Biostrings::readDNAStringSet(j_fa)
+      # Strip gap characters (. - =) inline — no external function needed
+      j_ung   <- gsub("[.=-]", "", as.character(j_seqs))
+      names(j_ung) <- names(j_seqs)
+      ct_key  <- sub("J$","",j_locus)            # IGHJ->IGH etc.
+      ct_out  <- chain_map_ai[ct_key]
+      # Chain-appropriate CDR3 anchor motifs (IMGT-defined):
+      #   Heavy (JH):  Trp (TGG) at position 118 of the J-REGION
+      #   Kappa (JK):  Phe (TTT|TTC) in FGXG motif
+      #   Lambda (JL): Phe (TTT|TTC) in FGXG motif
+      motif_pat <- switch(ct_key,
+        IGH = "TGG",
+        IGK = "TTT|TTC",
+        IGL = "TTT|TTC",
+        "TGG|TTT|TTC")   # safe fallback
+
+      written_j <- character(0L)
+      for (i in seq_along(j_ung)) {
+        nm  <- names(j_ung)[i]
+        nt  <- j_ung[i]
+
+        # ── Lookup from reference aux (tries full name, base name, gene only) ──
+        anchor_val <- frame_val <- extra_val <- NA_integer_
+        if (!is.null(ref_aux_dt_ai)) {
+          base_nm_lookup  <- sub("(\\*\\d+)_.*$", "\\1", nm)   # strip strain tag
+          gene_nm_lookup  <- sub("\\*.*$", "", base_nm_lookup)  # gene only e.g. IGKJ1
+          # Also try the short legacy name: IGKJ1 -> JK1, IGHJ2 -> JH2
+          chain_letter <- sub("^IG([HKL]).*$","\\1", nm)
+          seg_num <- regmatches(nm, regexpr("\\d+", nm))
+          short_nm <- if (length(seg_num)) paste0("J", chain_letter, seg_num) else ""
+          for (cand in c(nm, base_nm_lookup, gene_nm_lookup, short_nm)) {
+            if (nchar(cand) == 0L) next
+            hit <- ref_aux_dt_ai[gene == cand]
+            if (nrow(hit) > 0L) {
+              anchor_val <- hit$cdr3_stop[1L]
+              frame_val  <- hit$frame[1L]
+              extra_val  <- hit$extra_bps[1L]
+              break
+            }
+          }
+        }
+
+        # ── Motif fallback using chain-appropriate pattern ─────────────────
+        if (is.na(anchor_val)) {
+          wpos <- gregexpr(motif_pat, nt, ignore.case=TRUE)[[1L]]
+          if (wpos[1L] > 0L) {
+            anchor_val <- wpos[length(wpos)] + 2L   # 0-based inclusive stop
+            frame_val  <- anchor_val %% 3L
+          } else {
+            anchor_val <- 0L; frame_val <- 0L
+          }
+          extra_val <- 0L
+          cat(sprintf("  [AUX-motif] %s: no ref match, used %s motif -> stop=%d\n",
+                      nm, motif_pat, anchor_val))
+        }
+        if (is.na(extra_val)) extra_val <- 0L
+
+        writeLines(paste(nm, frame_val, ct_out,
+                         anchor_val, extra_val, sep="\t"), con_aux)
+        written_j <- c(written_j, nm)
+
+        # ── Base-name alias (strip strain tag) ────────────────────────────
+        base_nm <- sub("(\\*\\d+)_.*$", "\\1", nm)
+        if (base_nm != nm && !base_nm %in% written_j) {
+          writeLines(paste(base_nm, frame_val, ct_out,
+                           anchor_val, extra_val, sep="\t"), con_aux)
+          written_j <- c(written_j, base_nm)
+        }
+      }
+    }
+    close(con_aux)
+    cat(sprintf("  Wrote aux: %s\n", aux_path_ai))
+
+    # ── Build ndm.imgt from as-is V gene sequences ───────────────────────
+    cat("\n--- Building ndm.imgt (as-is-ids mode) ---\n")
+    ndm_path_ai <- file.path(aux_dir, paste0(file_prefix, ".ndm.imgt"))
+
+    gapped_dir_ai <- file.path(opt$outdir, "germlines", "gapped")
+    chain_ndm <- c(IGHV="VH", IGKV="VK", IGLV="VL")
+    fwr1_end  <- c(IGHV=75L, IGKV=78L, IGLV=78L)
+
+    first_nt_from <- function(chars, gpos) {
+      for (j in seq(gpos, length(chars)))
+        if (!chars[j] %in% c(".","=","-")) return(j)
+      NA_integer_
+    }
+    last_nt_to <- function(chars, gpos) {
+      gpos <- min(gpos, length(chars))
+      for (j in seq(gpos, 1L, -1L))
+        if (!chars[j] %in% c(".","=","-")) return(j)
+      NA_integer_
+    }
+
+    ndm_rows_ai <- rbindlist(lapply(names(chain_ndm), function(v_locus) {
+      v_fa <- file.path(gapped_dir_ai,
+                        paste0(imgt_file_prefix, "_", v_locus, ".fasta"))
+      if (!file.exists(v_fa)) return(data.table())
+      v_seqs <- Biostrings::readDNAStringSet(v_fa)
+      gene_bases <- sub("[*].*$", "", names(v_seqs))
+      v_seqs <- v_seqs[!duplicated(gene_bases)]
+      ct <- chain_ndm[v_locus]
+      fe <- fwr1_end[v_locus]
+      rbindlist(lapply(seq_along(v_seqs), function(i) {
+        chars <- strsplit(as.character(v_seqs[[i]]),"")[[1L]]
+        n     <- length(chars)
+        clamp <- function(s,e) {
+          s <- if (is.na(s)) -1L else as.integer(s)
+          e <- if (is.na(e)) -1L else as.integer(e)
+          if (s != -1L && e != -1L && s > e) { s <- -1L; e <- -1L }
+          c(s,e)
+        }
+        fwr1 <- clamp(first_nt_from(chars,1L),       last_nt_to(chars,min(fe,n)))
+        cdr1 <- clamp(first_nt_from(chars,min(fe+1L,n)), last_nt_to(chars,min(114L,n)))
+        fwr2_ss <- if(cdr1[2L]>0L) cdr1[2L]+1L else 115L
+        fwr2 <- clamp(first_nt_from(chars,min(fwr2_ss,n)), last_nt_to(chars,min(165L,n)))
+        cdr2_ss <- if(fwr2[2L]>0L) fwr2[2L]+1L else 166L
+        cdr2 <- clamp(first_nt_from(chars,min(cdr2_ss,n)), last_nt_to(chars,min(195L,n)))
+        fwr3_ss <- if(cdr2[2L]>0L) cdr2[2L]+1L else 196L
+        fwr3 <- clamp(first_nt_from(chars,min(fwr3_ss,n)), last_nt_to(chars,min(312L,n)))
+        nm <- names(v_seqs)[i]
+        base_nm <- sub("(\\*\\d+)_.*$","\\1", nm)
+        row1 <- data.table(gene=nm,
+          fwr1_start=fwr1[1L],fwr1_stop=fwr1[2L],
+          cdr1_start=cdr1[1L],cdr1_stop=cdr1[2L],
+          fwr2_start=fwr2[1L],fwr2_stop=fwr2[2L],
+          cdr2_start=cdr2[1L],cdr2_stop=cdr2[2L],
+          fwr3_start=fwr3[1L],fwr3_stop=fwr3[2L],
+          chain_type=ct, trailing=0L)
+        if (base_nm != nm) rbindlist(list(row1, {r2<-copy(row1);r2$gene<-base_nm;r2}))
+        else row1
+      }))
+    }), fill=TRUE)
+
+    if (nrow(ndm_rows_ai) > 0L) {
+      pos_cols <- setdiff(names(ndm_rows_ai), c("gene","chain_type","trailing"))
+      for (col in pos_cols) {
+        set(ndm_rows_ai, NULL, col, as.integer(ndm_rows_ai[[col]]))
+        set(ndm_rows_ai, which(is.na(ndm_rows_ai[[col]])), col, -1L)
+      }
+      con_ndm <- file(ndm_path_ai, open="wt")
+      for (r in seq_len(nrow(ndm_rows_ai))) {
+        pos_vals <- as.integer(unlist(ndm_rows_ai[r, pos_cols, with=FALSE]))
+        pos_vals[is.na(pos_vals)] <- -1L
+        if (length(pos_vals)==10L)
+          writeLines(paste(c(ndm_rows_ai$gene[r], pos_vals,
+                             ndm_rows_ai$chain_type[r], ndm_rows_ai$trailing[r]),
+                           collapse="\t"), con_ndm)
+      }
+      close(con_ndm)
+      # Copy to internal_data/
+      int_dir <- file.path(opt$outdir, "internal_data", opt$species)
+      if (dir.exists(int_dir)) {
+        int_nm <- file.path(int_dir, paste0(opt$species, ".ndm.imgt"))
+        file.copy(ndm_path_ai, int_nm, overwrite=TRUE)
+      }
+      cat(sprintf("  Wrote ndm.imgt: %s (%d V genes)\n",
+                  ndm_path_ai, nrow(ndm_rows_ai)))
+    }
+  }
+
+  source_as_is()
+  quit(save="no", status=0L)
+}
 cat(sprintf("Output     : %s\n\n", opt$outdir))
 
 # =============================================================================
@@ -230,7 +573,7 @@ read_fasta_safe <- function(path, locus = "", source_tag = "custom") {
   # Remove exact-duplicate sequences (same ungapped content) before naming.
   # Keep first occurrence; later duplicates are silently dropped here;
   # the header map still records them via the normalise step below.
-  raw_content <- as.character(RemoveGaps(seqs, removeGaps = "all"))
+  raw_content <- as.character(DECIPHER::RemoveGaps(seqs, removeGaps = "all"))
   dup_seq     <- duplicated(raw_content)
   if (any(dup_seq)) {
     message(sprintf("  [DEDUP] %s (%s): removing %d exact-duplicate sequences",
@@ -247,12 +590,12 @@ read_fasta_safe <- function(path, locus = "", source_tag = "custom") {
 
 ungap <- function(seqs) {
   if (is.null(seqs)) return(NULL)
-  # RemoveGaps requires XStringSet; for character vectors strip gap chars directly.
+  # removeGaps requires XStringSet; for character vectors strip gap chars directly.
   if (is(seqs, "XStringSet"))
-    return(RemoveGaps(seqs, removeGaps = "all"))
+    return(DECIPHER::RemoveGaps(seqs, removeGaps = "all"))
   if (is.character(seqs))
     return(gsub("[.-]", "", seqs))   # [.-] in a char class: literal dot and hyphen
-  RemoveGaps(seqs, removeGaps = "all")
+  DECIPHER::RemoveGaps(seqs, removeGaps = "all")
 }
 
 normalise_name <- function(nm) {
@@ -433,8 +776,8 @@ merge_with_priority <- function(custom_seqs, ref_seqs) {
   # Name dedup: keep custom on collision
   ref_name_only <- ref_seqs[!names(ref_seqs) %in% names(custom_seqs)]
   # Content dedup: exclude ref seqs whose ungapped content already appears in custom
-  custom_content <- as.character(RemoveGaps(custom_seqs, removeGaps = "all"))
-  ref_content    <- as.character(RemoveGaps(ref_name_only, removeGaps = "all"))
+  custom_content <- as.character(DECIPHER::RemoveGaps(custom_seqs, removeGaps = "all"))
+  ref_content    <- as.character(DECIPHER::RemoveGaps(ref_name_only, removeGaps = "all"))
   ref_novel      <- ref_name_only[!ref_content %in% custom_content]
   merged <- c(custom_seqs, ref_novel)
   merged[!duplicated(names(merged))]  # final name safety check
@@ -484,8 +827,8 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
   #   Compare by sequence content (ungapped) so gap-only differences don't
   #   trigger unnecessary clustering.  If every custom sequence is content-
   #   identical to a reference sequence (by name OR by content), skip PIgLET.
-  custom_seqs_chr <- as.character(RemoveGaps(custom_gapped, removeGaps = "all"))
-  ref_seqs_chr    <- as.character(RemoveGaps(ref_gapped,    removeGaps = "all"))
+  custom_seqs_chr <- as.character(DECIPHER::RemoveGaps(custom_gapped, removeGaps = "all"))
+  ref_seqs_chr    <- as.character(DECIPHER::RemoveGaps(ref_gapped,    removeGaps = "all"))
 
   # Compare by UNGAPPED SEQUENCE CONTENT ONLY.
   # Do NOT use name matching: OGRDB hash IDs (e.g. IGLV0-CXWW*00) normalise
@@ -623,10 +966,10 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
     }
   }
 
-  ref_ungapped_chr <- as.character(RemoveGaps(ref_gapped, removeGaps = "all"))
+  ref_ungapped_chr <- as.character(DECIPHER::RemoveGaps(ref_gapped, removeGaps = "all"))
 
   for (dc in missing_custom) {
-    dc_seq    <- as.character(RemoveGaps(custom_gapped[dc], removeGaps = "all"))
+    dc_seq    <- as.character(DECIPHER::RemoveGaps(custom_gapped[dc], removeGaps = "all"))
 
     # Case (i): content-identical to a reference allele
     ref_match <- ref_names[ref_ungapped_chr == dc_seq]
@@ -681,7 +1024,7 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
       # Final fallback: adist to all reference sequences
       # Exclude _dup sequences from the adist reference pool
       ref_joint_valid <- ref_for_joint[!grepl("_dup", names(ref_for_joint), fixed=TRUE)]
-      ref_ug_clean <- as.character(RemoveGaps(ref_joint_valid, removeGaps = "all"))
+      ref_ug_clean <- as.character(DECIPHER::RemoveGaps(ref_joint_valid, removeGaps = "all"))
       dists        <- as.integer(adist(dc_seq, ref_ug_clean))
       best_cleaned <- names(ref_joint_valid)[which.min(dists)]
       # Recover original IMGT name (with full subtype) from the reverse map
@@ -850,11 +1193,11 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
       }
       # Fallback: ungapped edit distance if dist_mat unavailable
       if (is.null(best_gene)) {
-        seq_i     <- as.character(RemoveGaps(
+        seq_i     <- as.character(DECIPHER::RemoveGaps(
                        custom_gapped[cust_nm], removeGaps = "all"))
         # Exclude _dup sequences from adist reference pool
         ref_valid2 <- ref_for_joint[!grepl("_dup", names(ref_for_joint), fixed=TRUE)]
-        ref_ug     <- as.character(RemoveGaps(ref_valid2, removeGaps = "all"))
+        ref_ug     <- as.character(DECIPHER::RemoveGaps(ref_valid2, removeGaps = "all"))
         dists      <- as.integer(adist(seq_i, ref_ug))
         best_cleaned  <- names(ref_valid2)[which.min(dists)]
         orig_closest  <- if (exists("rev_ref_name_map") && best_cleaned %in% names(rev_ref_name_map))
@@ -906,10 +1249,10 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
 
       # (2) ungapped edit distance fallback
       if (is.null(best_gene)) {
-        seq_i    <- as.character(RemoveGaps(custom_gapped[cust_nm], removeGaps="all"))
+        seq_i    <- as.character(DECIPHER::RemoveGaps(custom_gapped[cust_nm], removeGaps="all"))
         # Exclude _dup sequences from adist reference pool
         ref_valid  <- ref_for_joint[!grepl("_dup", names(ref_for_joint), fixed=TRUE)]
-        ref_ug     <- as.character(RemoveGaps(ref_valid, removeGaps="all"))
+        ref_ug     <- as.character(DECIPHER::RemoveGaps(ref_valid, removeGaps="all"))
         dists      <- as.integer(adist(seq_i, ref_ug))
         best_cl    <- names(ref_valid)[which.min(dists)]
         orig_cl    <- if (exists("rev_ref_name_map") && best_cl %in% names(rev_ref_name_map))
@@ -1131,7 +1474,7 @@ debug_script_path <- file.path(opt$outdir, paste0(opt$prefix, "_debug_session.R"
     "",
     "run_piglet_debug <- function(seqs_gapped, trim3, label = '') {",
     "  # Remove gap characters so PIgLET receives ungapped sequences",
-    "  seqs_ungapped <- DECIPHER::RemoveGaps(seqs_gapped, removeGaps = \"all\")",
+    "  seqs_ungapped <- DECIPHER::removeGaps(seqs_gapped, removeGaps = \"all\")",
     "  named_vec <- setNames(as.character(seqs_ungapped), names(seqs_ungapped))",
     "  cat(sprintf(\"Running PIgLET on %d seqs (%s)\\n\", length(named_vec), label))",
     "  piglet::inferAlleleClusters(",
@@ -1442,7 +1785,7 @@ post_normalise_seqs <- function(seqs, label = "", use_asc = FALSE) {
       annot_nms    <- nms_tmp[seq(n_bare_grp + 1L, length(nms_tmp))]
 
       tryCatch({
-        grp_ung <- RemoveGaps(grp_seqs, removeGaps = "all")
+        grp_ung <- DECIPHER::RemoveGaps(grp_seqs, removeGaps = "all")
         aligned <- DECIPHER::AlignSeqs(grp_ung, verbose = FALSE)
         dm      <- DECIPHER::DistanceMatrix(aligned, verbose = FALSE)
 
@@ -1506,7 +1849,7 @@ post_normalise_seqs <- function(seqs, label = "", use_asc = FALSE) {
   names(seqs) <- new_names
 
   # ---- Step 6: deduplicate by ungapped content ----
-  ug_content <- as.character(RemoveGaps(seqs, removeGaps = "all"))
+  ug_content <- as.character(DECIPHER::RemoveGaps(seqs, removeGaps = "all"))
   keep       <- !duplicated(ug_content)
   seqs       <- seqs[keep]
   name_map_pre <- name_map_pre[keep]
@@ -1823,10 +2166,29 @@ if (!is.null(ref_aux_dt) && nrow(ref_aux_dt) > 0L) {
     }
   }
 
-  # Write allele-level rows for the hybrid J genes
+  # Write allele-level rows for the hybrid J genes.
+  # For strain-tagged names (e.g. IGHJ1*01_C57BL/6), also write a base-name
+  # alias row (IGHJ1*01) with the same anchor so igblastn productivity
+  # calculation finds the CDR3 anchor regardless of which name variant
+  # appears in the alignment output.
+  written_genes <- character(0L)
   for (r in seq_len(nrow(aux_out))) {
-    writeLines(paste(aux_out$gene[r], aux_out$frame[r], aux_out$chain_type[r],
-                     aux_out$cdr3_stop[r], aux_out$extra_bps[r], sep = "\t"), con)
+    nm      <- aux_out$gene[r]
+    fr      <- aux_out$frame[r]
+    ct      <- aux_out$chain_type[r]
+    stop_   <- aux_out$cdr3_stop[r]
+    extra_  <- aux_out$extra_bps[r]
+    writeLines(paste(nm, fr, ct, stop_, extra_, sep = "\t"), con)
+    written_genes <- c(written_genes, nm)
+    # Write base-name alias if name has a strain tag (contains _ after the allele)
+    # e.g. IGHJ1*01_C57BL/6 -> base = IGHJ1*01
+    base_nm <- sub("_[^*_][^*]*$", "", nm)  # strip _anything that follows *xx
+    # more precisely: strip the last _<tag> that is NOT part of the allele *xx
+    base_nm2 <- sub("(\*\d+)_.*$", "\\1", nm)
+    if (base_nm2 != nm && !base_nm2 %in% written_genes) {
+      writeLines(paste(base_nm2, fr, ct, stop_, extra_, sep = "\t"), con)
+      written_genes <- c(written_genes, base_nm2)
+    }
   }
   close(con)
 }
@@ -1926,8 +2288,10 @@ build_ndm_rows <- function(v_gapped, chain_type, label) {
     fwr3 <- clamp2(first_nt_from(chars, min(fwr3_search_start, n)),
                    last_nt_to  (chars, min(fwr3_end_char, n)))
 
-    data.table(
-      gene       = names(v_gapped)[i],
+    nm       <- names(v_gapped)[i]
+    base_nm  <- sub("(\\*\\d+)_.*$", "\\1", nm)   # strip strain tag if present
+    row_vals <- data.table(
+      gene       = nm,
       fwr1_start = fwr1[1L], fwr1_stop = fwr1[2L],
       cdr1_start = cdr1[1L], cdr1_stop = cdr1[2L],
       fwr2_start = fwr2[1L], fwr2_stop = fwr2[2L],
@@ -1936,6 +2300,14 @@ build_ndm_rows <- function(v_gapped, chain_type, label) {
       chain_type = chain_type,
       trailing   = 0L
     )
+    # If strain-tagged, also add a base-name row so igblastn can find
+    # FWR/CDR positions regardless of which name variant it reports
+    if (base_nm != nm) {
+      base_row <- copy(row_vals); base_row$gene <- base_nm
+      rbindlist(list(row_vals, base_row))
+    } else {
+      row_vals
+    }
   })
   rbindlist(rows)
 }

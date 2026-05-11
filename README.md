@@ -14,9 +14,11 @@
 
 ## Overview
 
-blendAIRR merges custom species germline sequences (e.g. from a non-reference mouse strain such as MRL) with the closest available IMGT reference species (e.g. C57BL/6 mouse). Novel alleles are jointly clustered with the reference set using [PIgLET](https://bitbucket.org/yaarilab/piglet), which assigns each novel sequence an IMGT-style gene-family designation based on co-clustering with known reference alleles.
+blendAIRR merges custom germline sequences (e.g. from a non-reference mouse strain such as MRL) with the closest available IMGT reference species (e.g. C57BL/6 mouse) to produce a ready-to-run IgBLAST reference database. Two annotation modes are available:
 
-The result is a ready-to-run IgBLAST database with all required auxiliary, annotation, and pipeline files — including per-chain `igblastn → MakeDb.py` wrapper scripts and an install script for adding the reference into an existing IGDATA directory.
+**`--as-is-ids` (recommended)** — Input allele names are used directly. Custom sequences are merged with reference sequences, exact duplicates are removed, and duplicate allele names across strains are disambiguated by appending a strain tag (e.g. `IGHV1-11*01_C57BL/6`). No gene-family clustering is performed. This is the simpler, faster, and more transparent approach — allele names in the output directly correspond to names in your input FASTAs and the IMGT reference.
+
+**Default (PIgLET clustering)** — Novel alleles are jointly clustered with the reference set using [PIgLET](https://bitbucket.org/yaarilab/piglet), which assigns each novel sequence an IMGT-style gene-family name based on co-clustering with known reference alleles. Novel sequences receive new allele designations (e.g. `IGHV1-24*05`). **Downstream analysis must use the allele name mapping table** (`annotations/<prefix>_name_map.tsv`) to reconcile original input names with the renamed alleles assigned by blendAIRR. If PIgLET fails to load, blendAIRR automatically falls back to `--as-is-ids` mode with a warning.
 
 ---
 
@@ -26,13 +28,14 @@ The result is a ready-to-run IgBLAST database with all required auxiliary, annot
 # Pull
 docker pull ghcr.io/dduchen/blendairr:latest
 
-# Run — mount the directory containing your input FASTAs
+# Run (recommended: --as-is-ids)
 docker run --rm \
   -v "$(pwd)/data":/data \
   ghcr.io/dduchen/blendairr:latest \
   --species mouse \
   --input_dir /data/MRL \
-  --outdir /data/mrl_ref
+  --outdir /data/mrl_ref \
+  --as-is-ids
 
 # Annotate sequences (generated scripts are in the output directory)
 bash data/mrl_ref/hybrid_run_heavy.sh sequences.fasta out_prefix
@@ -47,14 +50,61 @@ singularity pull docker://ghcr.io/dduchen/blendairr:latest
 singularity run blendAIRR_latest.sif \
   --species mouse \
   --input_dir ./MRL \
-  --outdir ./mrl_ref
+  --outdir ./mrl_ref \
+  --as-is-ids
 ```
+
+---
+
+## Annotation modes
+
+### `--as-is-ids` — recommended for most users
+
+Input allele names are preserved directly. blendAIRR:
+
+1. Loads your custom FASTAs and the IMGT reference FASTAs for the specified species.
+2. Merges them (custom sequences first).
+3. Removes exact-duplicate sequences (keeping the custom sequence when both are identical).
+4. Renames any remaining alleles that share a name but represent distinct sequences by appending `_1`, `_2` etc.
+5. Parses IMGT pipe-delimited headers (e.g. `BK063713|IGHV1-11*01|Mus_musculus_BALB/cJ|F|V-R`) into clean allele+strain tags (e.g. `IGHV1-11*01_BALB/cJ`).
+
+The allele names in igblastn output, MakeDb.py output, and your analysis are all identical to the names in your input files and the IMGT reference — **no mapping table is needed**.
+
+```bash
+build_hybrid_igblast_ref \
+  --species mouse \
+  --input_dir ./MRL \
+  --outdir ./mrl_ref \
+  --as-is-ids
+```
+
+### Default (PIgLET clustering) — for novel allele discovery
+
+PIgLET jointly clusters your custom sequences with the reference and assigns IMGT-style gene-family names to novel alleles. A sequence with no close reference match may be assigned a name like `IGHV1-24*05` (next available allele number in that gene family).
+
+**Important:** every novel allele receives a new name that differs from its original input identifier. All downstream analysis must join on the name mapping table to recover the original source sequence IDs.
+
+```bash
+# Build
+build_hybrid_igblast_ref \
+  --species mouse \
+  --input_dir ./MRL \
+  --outdir ./mrl_ref
+
+# The name mapping table:
+#   annotations/hybrid_name_map.tsv
+#   columns: source_id (original input name) -> new_allele (assigned IMGT name)
+```
+
+### `--asc`
+
+Uses PIgLET ASC (Allele Sequence Cluster) names (`IGHVFx-Gy*01`) instead of IMGT-style reference-derived names. The same mapping-table caveat as the default mode applies.
 
 ---
 
 ## Input requirements
 
-blendAIRR expects IMGT-gapped germline FASTA files (dots for gap positions, 312 nt V region) organised as follows. Missing files are filled automatically from the reference species.
+blendAIRR expects IMGT-gapped germline FASTA files (dots for gap positions, 312 nt V region) organised as follows. Missing loci are filled automatically from the reference species.
 
 ```
 input_dir/
@@ -71,21 +121,31 @@ input_dir/
 
 Files may also sit directly in `input_dir/` without subdirectories.
 
+**FASTA header formats accepted in `--as-is-ids` mode:**
+
+| Input header | Output name |
+|---|---|
+| `IGHV7-1*01_S6154` | `IGHV7-1*01_S6154` (kept as-is) |
+| `IGHV7-3*04` | `IGHV7-3*04` (kept as-is) |
+| `BK063713\|IGHV1-18-28*01\|Mus_musculus_BALB/cJ\|F\|V-R` | `IGHV1-18-28*01_BALB/cJ` |
+| `AC090843\|IGHV1-11*01\|Mus_musculus_C57BL/6\|F\|V-REGI` | `IGHV1-11*01_C57BL/6` |
+
 ---
 
 ## Key arguments
 
 | Argument | Required | Description |
 |---|---|---|
-| `--species` | ✓ | Closest IMGT reference species (e.g. `mouse`, `human`). Run `--list_species` to see what is available in your IGDATA. |
+| `--species` | ✓ | Closest IMGT reference species (e.g. `mouse`, `human`). Run `--list_species` to see what is available. |
 | `--input_dir` | ✓ | Directory containing your custom germline FASTAs (see layout above). |
 | `--outdir` | ✓ | Output directory — created if absent. |
+| `--as-is-ids` | | **Recommended.** Use input allele names directly; skip PIgLET clustering. No name mapping table required downstream. |
 | `--prefix` | | Prefix for all output filenames (default: `hybrid`). |
-| `--asc` | | Use PIgLET ASC cluster names (`IGHVFx-Gy*01`) instead of IMGT-style names derived from the closest reference allele. |
+| `--asc` | | Use PIgLET ASC cluster names (`IGHVFx-Gy*01`) instead of IMGT-style names. Requires PIgLET. |
 | `--skip_blast` | | Skip `makeblastdb` — annotation only. |
 | `--list_species` | | List available IMGT species and exit. |
 
-Run `build_hybrid_igblast_ref --help` (or `docker run --rm ghcr.io/dduchen/blendairr --help`) for the full argument reference.
+Run `build_hybrid_igblast_ref --help` for the full argument reference including advanced options (`--family_threshold`, `--allele_threshold`, `--chain`, `--v_trim3`, `--j_trim3`).
 
 ---
 
@@ -99,10 +159,10 @@ outdir/
     gapped/              ← hybrid gapped FASTAs — pass to MakeDb.py -r
     ungapped/            ← ungapped FASTAs (intermediate)
   fasta/                 ← edit_imgt_file.pl-processed FASTAs (BLAST input)
-  database/              ← IgBLAST BLAST databases (makeblastdb output)
+  database/              ← IgBLAST BLAST databases (per-locus + combined)
   auxiliary/             ← J-gene aux file + V-gene ndm.imgt annotation
   internal_data/<sp>/    ← internal BLAST DBs for igblastn -organism
-  annotations/           ← PIgLET cluster tables, header maps, provenance TSVs
+  annotations/           ← cluster tables, header maps, name mapping TSVs *
   logs/                  ← per-step log files
 
   hybrid_run_heavy.sh          ← igblastn + MakeDb.py pipeline for IGH
@@ -112,20 +172,73 @@ outdir/
   hybrid_manifest.tsv          ← inventory of all output files
 ```
 
+\* `annotations/` is only populated in default (PIgLET) and `--asc` modes. In `--as-is-ids` mode no name mapping table is produced because allele names are unchanged.
+
+### Name mapping table (PIgLET mode only)
+
+`annotations/hybrid_name_map.tsv` contains two key columns:
+
+| Column | Description |
+|---|---|
+| `source_id` | Original allele name from your input FASTA |
+| `new_allele` | IMGT-style name assigned by blendAIRR |
+
+Join this table onto igblastn / MakeDb.py output using the `v_call`, `d_call`, or `j_call` columns to recover provenance:
+
+```R
+library(data.table)
+name_map <- fread("annotations/hybrid_name_map.tsv")
+airr_data <- fread("changeo/gather_gex_heavy_db-pass.tsv")
+airr_data[name_map, source_id := i.source_id, on = .(v_call = new_allele)]
+```
+
 ### Generated pipeline scripts
 
-Each generated script contains embedded absolute paths baked in at build time — no configuration needed after `blendAIRR` finishes.
+Each script contains embedded absolute paths baked in at build time.
 
 ```bash
-# Heavy chain (IGH): igblastn fmt7 + AIRR, then MakeDb.py
+# Heavy chain (IGH)
 bash outdir/hybrid_run_heavy.sh sequences.fasta out_prefix [makedb_outdir]
 
-# Light chain (IGK + IGL): same pipeline, separate igblastn calls per locus
+# Light chain (IGK + IGL)
 bash outdir/hybrid_run_light.sh sequences.fasta out_prefix [makedb_outdir]
 
 # Install into an existing IGDATA (dry-run first!)
 bash outdir/hybrid_install_to_igdata.sh ~/share/igblast --dry-run
 bash outdir/hybrid_install_to_igdata.sh ~/share/igblast
+```
+
+---
+
+## Installing into an existing IGDATA
+
+The install script copies all required files into an existing IgBLAST share directory and builds the combined `ig_v`/`ig_d`/`ig_j` databases via `makeblastdb`. A `--dry-run` flag previews every file operation before committing.
+
+```bash
+bash outdir/hybrid_install_to_igdata.sh $IGDATA --dry-run
+bash outdir/hybrid_install_to_igdata.sh $IGDATA
+
+# If your germlines directory is in a non-standard location:
+bash outdir/hybrid_install_to_igdata.sh $IGDATA \
+  --germlines-root /path/to/germlines
+
+# Override the organism name if needed:
+bash outdir/hybrid_install_to_igdata.sh $IGDATA \
+  --organism-name mrl_mouse
+```
+
+After installation, run igblastn with:
+
+```bash
+export IGDATA=~/share/igblast
+igblastn \
+  -organism       hybrid_mouse \
+  -germline_db_V  $IGDATA/database/imgt_hybrid_mouse_IGHV \
+  -germline_db_D  $IGDATA/database/imgt_hybrid_mouse_IGHD \
+  -germline_db_J  $IGDATA/database/imgt_hybrid_mouse_IGHJ \
+  -auxiliary_data $IGDATA/optional_file/hybrid_mouse_gl.aux \
+  -domain_system  imgt -ig_seqtype Ig \
+  -outfmt 19 -query sequences.fasta -out output.airr.tsv
 ```
 
 ---
@@ -136,6 +249,10 @@ bash outdir/hybrid_install_to_igdata.sh ~/share/igblast
 git clone https://github.com/dduchen/blendairr
 cd blendAIRR
 
+# Vendor the pre-built PIgLET package from your local R library
+bash vendor_piglet.sh
+git add vendor/piglet-built && git commit -m "vendor piglet"
+
 # Build
 make build
 
@@ -143,17 +260,12 @@ make build
 make test
 
 # Run with local image
-make run ARGS="--species mouse --input_dir /data/MRL --outdir /data/out"
-
-# Build a Singularity image from the local Docker image
-make singularity
+make run ARGS="--species mouse --input_dir /data/MRL --outdir /data/out --as-is-ids"
 ```
 
 ---
 
 ## GitHub Container Registry — image tags
-
-Images are built and pushed automatically by the CI/CD pipeline on every push to `main` and every version tag.
 
 | Git event | Docker tags |
 |---|---|
@@ -163,7 +275,7 @@ Images are built and pushed automatically by the CI/CD pipeline on every push to
 
 Pin to a specific release for reproducible workflows:
 ```bash
-docker pull ghcr.io/dduchen/blendairr:1.0.0
+docker pull ghcr.io/dduchen/blendairr:1.2.0
 ```
 
 ---

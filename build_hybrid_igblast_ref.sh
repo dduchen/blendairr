@@ -1,88 +1,77 @@
 #!/usr/bin/env bash
 # =============================================================================
-# build_blendAIRR.sh
+# blendAIRR — build_hybrid_igblast_ref.sh
 #
 # DESCRIPTION
 #   Builds a hybrid IgBLAST germline reference database by merging custom
-#   species germline sequences (e.g. from a non-reference mouse strain) with
-#   the closest available IMGT reference species (e.g. mouse).
-#
-#   Novel sequences are jointly clustered with the reference set using PIgLET,
-#   which assigns each novel allele an IMGT-style gene-family name based on
-#   co-clustering with known reference alleles.  The result is a ready-to-run
-#   IgBLAST database with matching auxiliary and annotation files.
+#   germline sequences (e.g. a non-reference mouse strain) with the closest
+#   IMGT reference species. By default, novel alleles are jointly clustered
+#   with the reference using PIgLET to assign IMGT-style gene-family names.
+#   Use --as-is-ids to skip clustering and keep input names directly.
 #
 # QUICK START
-#   bash build_blendAIRR.sh \
-#       --species mouse \
-#       --input_dir ./MRL/ \
-#       --outdir ./mrl_igblast_ref
+#   # Docker (recommended):
+#   docker run --rm -v $(pwd)/data:/data ghcr.io/dduchen/blendairr:latest \
+#       --species mouse --input_dir /data/MRL --outdir /data/out
 #
-#   Then annotate sequences:
+#   # Direct:
+#   bash build_hybrid_igblast_ref.sh \
+#       --species mouse --input_dir ./MRL --outdir ./mrl_igblast_ref
+#
+#   # Then annotate:
 #   bash ./mrl_igblast_ref/hybrid_run_heavy.sh sequences.fasta out_prefix
 #   bash ./mrl_igblast_ref/hybrid_run_light.sh sequences.fasta out_prefix
 #
-# REQUIRED ARGUMENTS
-#   -s, --species SPECIES   Closest IMGT reference species for co-clustering.
-#                           Must match a species available in your IGDATA
-#                           germline directory (e.g. mouse, human, rat).
-#                           Run --list_species to see what is available.
-#
-#   -i, --input_dir DIR     Directory containing your custom germline FASTA
-#                           files. Expected layout:
+# REQUIRED
+#   -s, --species SPECIES   Closest IMGT reference species (e.g. mouse, human).
+#                           Run --list_species to see available options.
+#   -i, --input_dir DIR     Directory containing custom germline FASTAs:
 #                             DIR/heavy/IGHV.fasta  (required)
-#                             DIR/heavy/IGHD.fasta  (optional)
-#                             DIR/heavy/IGHJ.fasta  (optional)
-#                             DIR/light/IGKV.fasta  (optional)
-#                             DIR/light/IGKJ.fasta  (optional)
-#                             DIR/light/IGLV.fasta  (optional)
-#                             DIR/light/IGLJ.fasta  (optional)
-#                           Files may also sit directly in DIR/ without
-#                           subdirectories.  All V files must be IMGT-gapped
-#                           (dots for gap positions, 312 nt V region).
-#                           Missing files are filled from the reference species.
+#                             DIR/heavy/IGHD.fasta  DIR/heavy/IGHJ.fasta
+#                             DIR/light/IGK*.fasta  DIR/light/IGL*.fasta
+#                           Files may also sit directly in DIR/. All V files
+#                           must be IMGT-gapped (dots = gaps, 312 nt V region).
+#                           Missing loci are filled from the reference species.
+#   -o, --outdir DIR        Output directory (created if absent).
 #
-#   -o, --outdir DIR        Output directory (created if absent). All outputs
-#                           are written here -- see OUTPUT FOLDERS below.
-#
-# OPTIONAL ARGUMENTS
-#   -g, --igdata DIR        IgBLAST share directory containing internal_data/
-#                           and optional_file/. Defaults to the $IGDATA
-#                           environment variable or auto-detection from PATH.
-#   -p, --prefix STR        Prefix for all output filenames (default: hybrid).
-#   -r, --rscript PATH      Full path to Rscript binary (default: auto-detect).
-#   -e, --edit_imgt PATH    Path to edit_imgt_file.pl from the IgBLAST package
-#                           (default: auto-detect next to igblastn in PATH).
+# NAMING / CLUSTERING
+#   (default)               PIgLET joint clustering assigns IMGT-style names to
+#                           novel alleles. Falls back to --as-is-ids if PIgLET
+#                           fails to load, with a warning in the log.
+#   --as-is-ids             Skip PIgLET; use input FASTA allele names directly.
+#                           Exact-duplicate sequences are removed first; then
+#                           duplicate names (distinct sequences) are suffixed
+#                           _1, _2 ... (e.g. IGHV1-1*01, IGHV1-1*01_1).
 #   --asc                   Use PIgLET ASC cluster names (e.g. IGHVFx-Gy*01)
-#                           instead of the default IMGT-style names derived
-#                           from the closest reference allele.
-#   --skip_blast            Skip the makeblastdb step (annotation only).
-#   --skip_constant         Skip building the constant region database.
-#   --family_threshold N    PIgLET gene-family clustering threshold (default: 75).
+#                           instead of IMGT-style reference-derived names.
+#
+# OPTIONAL
+#   -g, --igdata DIR        IgBLAST share directory (default: $IGDATA or PATH).
+#   -p, --prefix STR        Output file prefix (default: hybrid).
+#   -r, --rscript PATH      Path to Rscript binary (default: auto-detect).
+#   -e, --edit_imgt PATH    Path to edit_imgt_file.pl (default: auto-detect).
+#   --skip_blast            Annotation only; skip makeblastdb.
+#   --skip_constant         Skip constant region database build.
+#   --family_threshold N    PIgLET family clustering threshold (default: 75).
 #   --allele_threshold N    PIgLET allele cluster threshold (default: 95).
-#   --v_trim3 N             3-prime trim length for V clustering (default: 318).
-#   --j_trim3 N             3-prime trim length for J clustering (default: 40).
-#   --list_species          List available IMGT species in IGDATA and exit.
-#   -h, --help              Show this help message and exit.
+#   --v_trim3 N             3-prime V trim for clustering (default: 318).
+#   --j_trim3 N             3-prime J trim for clustering (default: 40).
+#   --chain heavy|light|all Chain(s) for generated igblastn scripts (default: all).
+#   --list_species          List available IMGT species and exit.
+#   -h, --help              Show this help and exit.
 #
-# OUTPUT FOLDERS  (all under --outdir)
-#   germlines/gapped/       Hybrid gapped FASTAs — pass these to MakeDb.py -r
-#   germlines/ungapped/     Ungapped FASTAs (intermediate; not needed directly)
-#   fasta/                  edit_imgt_file.pl-processed FASTAs (BLAST input)
-#   database/               IgBLAST BLAST databases built by makeblastdb
-#   auxiliary/              J-gene aux file and V-gene ndm.imgt annotation
-#   internal_data/<species> Internal BLAST DBs required by igblastn -organism
-#   annotations/            PIgLET cluster tables, header maps, provenance TSVs
-#   logs/                   Per-step log files
-#
-# OUTPUT SCRIPTS  (in --outdir root)
-#   <prefix>_run_heavy.sh         igblastn + MakeDb.py pipeline for IGH
-#   <prefix>_run_light.sh         igblastn + MakeDb.py pipeline for IGK + IGL
-#   <prefix>_install_to_igdata.sh Copy reference files into an IGDATA directory
-#   <prefix>_igblast_cmd.sh       Low-level igblastn wrapper (all chains)
-#   <prefix>_manifest.tsv         Inventory of all output files with sizes
+# OUTPUTS  (under --outdir)
+#   germlines/gapped/            Hybrid gapped FASTAs (MakeDb.py -r input)
+#   database/                    IgBLAST BLAST databases (per-locus + combined)
+#   auxiliary/                   J-gene aux file + V-gene ndm.imgt
+#   internal_data/<organism>/    Internal BLAST DBs for igblastn -organism
+#   annotations/                 Cluster tables, name maps, provenance TSVs
+#   logs/                        Per-step logs
+#   <prefix>_run_heavy.sh        igblastn + MakeDb.py pipeline — IGH
+#   <prefix>_run_light.sh        igblastn + MakeDb.py pipeline — IGK + IGL
+#   <prefix>_install_to_igdata.sh  Install reference into an IGDATA directory
+#   <prefix>_manifest.tsv        File inventory
 # =============================================================================
-
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -104,6 +93,7 @@ V_TRIM3=318
 J_TRIM3=40
 LIST_SPECIES=false
 USE_ASC=false
+AS_IS_IDS=false   # skip PIgLET clustering; use input IDs directly
 CHAIN="all"   # heavy | light | all
 
 # ---------------------------------------------------------------------------
@@ -145,6 +135,7 @@ while [[ $# -gt 0 ]]; do
     --j_trim3)              J_TRIM3="$2";        shift 2 ;;
     --list_species)         LIST_SPECIES=true;   shift ;;
     --asc)                  USE_ASC=true;        shift ;;
+    --as-is-ids)            AS_IS_IDS=true;      shift ;;
     --chain)                CHAIN="$2";          shift 2 ;;
     -h|--help)              usage ;;
     *) die "Unknown argument: $1" ;;
@@ -520,23 +511,65 @@ ORGANISM="${PREFIX}_${SPECIES}"
 # ---------------------------------------------------------------------------
 header "Step 1: PIgLET joint clustering and germline construction (R)"
 
-R_SCRIPT="$SCRIPT_DIR/R/piglet_annotate_and_build.R"
-[[ -f "$R_SCRIPT" ]] || die "R script not found: $R_SCRIPT"
+R_SCRIPT="${HYBRID_IGBLAST_R_SCRIPT:-$SCRIPT_DIR/R/piglet_annotate_and_build.R}"
 
-$RSCRIPT "$R_SCRIPT" \
-  --custom_dir        "$INPUT_DIR" \
-  --ref_dir           "${REF_VDJ_DIR:-$INPUT_DIR}" \
-  --species           "$SPECIES" \
-  --outdir            "$OUTDIR" \
-  --igdata            "$IGDATA" \
-  --prefix            "$PREFIX" \
-  --family_threshold  "$FAM_THRESH" \
-  --allele_cluster_threshold "$ALLELE_THRESH" \
-  --v_trim3prime      "$V_TRIM3" \
-  --j_trim3prime      "$J_TRIM3" \
-  $($USE_ASC && echo "--use_asc") \
-  --organism          "$ORGANISM" \
-  2>&1 | tee "$OUTDIR/logs/piglet_annotate.log"
+# ---------------------------------------------------------------------------
+# Run mode: --as-is-ids skips PIgLET and uses input allele names directly.
+# Default (PIgLET) mode falls back to as-is automatically if PIgLET fails.
+# ---------------------------------------------------------------------------
+_run_piglet() {
+  [[ -f "$R_SCRIPT" ]] || { warn "R script not found: $R_SCRIPT"; return 1; }
+  # Verify PIgLET loads before attempting the full run
+  if ! $RSCRIPT -e "library(piglet)" 2>/dev/null; then
+    warn "PIgLET R package could not be loaded."
+    warn "  Verify install: Rscript -e \"library(piglet)\""
+    return 1
+  fi
+  $RSCRIPT "$R_SCRIPT" \
+    --custom_dir        "$INPUT_DIR" \
+    --ref_dir           "${REF_VDJ_DIR:-$INPUT_DIR}" \
+    --species           "$SPECIES" \
+    --outdir            "$OUTDIR" \
+    --igdata            "$IGDATA" \
+    --prefix            "$PREFIX" \
+    --family_threshold  "$FAM_THRESH" \
+    --allele_cluster_threshold "$ALLELE_THRESH" \
+    --v_trim3prime      "$V_TRIM3" \
+    --j_trim3prime      "$J_TRIM3" \
+    $($USE_ASC && echo "--use_asc") \
+    --organism          "$ORGANISM" \
+    2>&1 | tee "$OUTDIR/logs/piglet_annotate.log"
+}
+
+_run_as_is() {
+  info "Running in --as-is-ids mode: input allele names used directly."
+  info "  Sequence deduplication: ON  |  Name deduplication: appends _1, _2 ..."
+  [[ -f "$R_SCRIPT" ]] || { warn "R script not found: $R_SCRIPT"; return 1; }
+  $RSCRIPT "$R_SCRIPT" \
+    --custom_dir        "$INPUT_DIR" \
+    --ref_dir           "${REF_VDJ_DIR:-$INPUT_DIR}" \
+    --species           "$SPECIES" \
+    --outdir            "$OUTDIR" \
+    --igdata            "$IGDATA" \
+    --prefix            "$PREFIX" \
+    --organism          "$ORGANISM" \
+    --as_is_ids \
+    2>&1 | tee "$OUTDIR/logs/as_is_annotate.log"
+}
+
+if $AS_IS_IDS; then
+  info "Mode: --as-is-ids (PIgLET clustering skipped)"
+  _run_as_is || die "as-is-ids annotation step failed."
+else
+  info "Mode: PIgLET joint clustering (default)"
+  if ! _run_piglet; then
+    warn "PIgLET clustering failed. Retrying in --as-is-ids fallback mode."
+    warn "  Original log: $OUTDIR/logs/piglet_annotate.log"
+    warn "  To skip PIgLET intentionally, use: --as-is-ids"
+    _run_as_is || die "as-is-ids fallback also failed. Check input files."
+    warn "Completed in as-is-ids fallback mode. Allele names taken from input FASTAs."
+  fi
+fi
 
 ok "R annotation complete"
 
@@ -1545,16 +1578,28 @@ echo ""
 echo "--- Auxiliary file -> optional_file/ ---"
 safe_copy "$SRC_AUX" "${IGDATA_TARGET}/optional_file"
 
-# ── 8. V gene annotation -> internal_data/<organism>/
-echo ""
+# ── 8. V gene annotation and domain models -> internal_data/<organism>/
+#
+#    .ndm.imgt  — NT FWR/CDR positions in the UNGAPPED sequence.
+#                Generated de novo by blendAIRR from the hybrid gapped FASTAs.
+#
+#    .pdm.imgt  — Protein FWR/CDR positions (IMGT numbering).
+#                IMGT protein positions are conserved across all Ig V gene
+#                families in a species (e.g. VH aa 1-25 = FWR1 for all IGHV),
+#                so the reference .pdm.imgt is valid for hybrid sequences.
+#                Generating this de novo requires the undocumented IgBLAST
+#                binary format; copying from reference is correct and safe.
+#
+#    .ndm.kabat/.pdm.kabat — Kabat-numbered equivalents. Only consulted
+#                when -domain_system kabat is used. blendAIRR always uses
+#                -domain_system imgt, so these are safe reference copies.
 echo ""
 echo "--- V gene annotation + domain models -> internal_data/${ORGANISM}/ ---"
-echo "    (ndm.imgt from hybrid build; pdm/kabat copied from reference species)"
+echo "  ndm.imgt: generated from hybrid sequences"
+echo "  pdm.imgt, ndm/pdm.kabat: copied from reference (IMGT positions conserved)"
 INT_DEST="${IGDATA_TARGET}/internal_data/${ORGANISM}"
 REF_INT="${IGDATA_TARGET}/internal_data/${REF_SPECIES}"
-# ndm.imgt: hybrid-specific (already installed by blendAIRR)
 safe_copy "$SRC_NDM" "$INT_DEST" "${ORGANISM}.ndm.imgt"
-# pdm.imgt + kabat variants: copy from reference (coordinate positions are conserved)
 safe_copy "${REF_INT}/${REF_SPECIES}.pdm.imgt"  "$INT_DEST" "${ORGANISM}.pdm.imgt"
 safe_copy "${REF_INT}/${REF_SPECIES}.ndm.kabat" "$INT_DEST" "${ORGANISM}.ndm.kabat"
 safe_copy "${REF_INT}/${REF_SPECIES}.pdm.kabat" "$INT_DEST" "${ORGANISM}.pdm.kabat"
