@@ -39,6 +39,14 @@
 #     --igdata     /path/to/igblast/share
 # =============================================================================
 
+# =============================================================================
+# Expand .libPaths() to include previous R version libraries and common
+# system library paths. This allows the script to find packages installed
+# under a different R minor version (e.g. rocker base image R 4.3.x libs
+# when running under R 4.4.x), and packages installed in user or site
+# libraries not on the default search path.
+# =============================================================================
+
 suppressPackageStartupMessages({
   library(optparse)
   library(data.table)
@@ -346,8 +354,35 @@ if (isTRUE(opt$as_is_ids)) {
         }
       }
     }
+    # ── Append any reference J entries not already written ──────────────
+    # Sequence deduplication in source_as_is() removes J sequences that are
+    # identical to reference sequences, so those J genes never appear in the
+    # hybrid gapped FASTA and would be missing from the aux. Copy them from
+    # the reference aux so igblastn can find CDR3 anchors for all J alleles.
+    if (!is.null(ref_aux_dt_ai)) {
+      ref_j_entries <- ref_aux_dt_ai[grepl("\\*", gene)]  # IMGT allele entries only
+      n_added <- 0L
+      for (r in seq_len(nrow(ref_j_entries))) {
+        nm_r <- ref_j_entries$gene[r]
+        # Normalise: strip strain tag for comparison
+        base_r <- sub("(\\*\\d+)_.*$", "\\1", nm_r)
+        if (!nm_r %in% written_j && !base_r %in% written_j) {
+          writeLines(paste(nm_r,
+                           ref_j_entries$frame[r],
+                           ref_j_entries$chain_type[r],
+                           ref_j_entries$cdr3_stop[r],
+                           ref_j_entries$extra_bps[r], sep="\t"), con_aux)
+          written_j <- c(written_j, nm_r, base_r)
+          n_added <- n_added + 1L
+        }
+      }
+      if (n_added > 0L)
+        cat(sprintf("  [AUX] Appended %d reference J entries not in hybrid FASTAs\n",
+                    n_added))
+    }
     close(con_aux)
-    cat(sprintf("  Wrote aux: %s\n", aux_path_ai))
+    cat(sprintf("  Wrote aux: %s (%d total entries)\n",
+                aux_path_ai, length(written_j)))
 
     # ── Build ndm.imgt from as-is V gene sequences ───────────────────────
     cat("\n--- Building ndm.imgt (as-is-ids mode) ---\n")
@@ -381,20 +416,32 @@ if (isTRUE(opt$as_is_ids)) {
       rbindlist(lapply(seq_along(v_seqs), function(i) {
         chars <- strsplit(as.character(v_seqs[[i]]),"")[[1L]]
         n     <- length(chars)
-        clamp <- function(s,e) {
-          s <- if (is.na(s)) -1L else as.integer(s)
-          e <- if (is.na(e)) -1L else as.integer(e)
-          if (s != -1L && e != -1L && s > e) { s <- -1L; e <- -1L }
-          c(s,e)
+        # Convert gapped character index -> ungapped nucleotide count.
+        # igblastn ndm.imgt requires UNGAPPED positions.
+        .ung_ai <- function(gp) {
+          if (is.na(gp) || gp < 1L) return(gp)
+          sum(!chars[seq_len(min(gp, n))] %in% c(".","-","="))
         }
-        fwr1 <- clamp(first_nt_from(chars,1L),       last_nt_to(chars,min(fe,n)))
-        cdr1 <- clamp(first_nt_from(chars,min(fe+1L,n)), last_nt_to(chars,min(114L,n)))
-        fwr2_ss <- if(cdr1[2L]>0L) cdr1[2L]+1L else 115L
-        fwr2 <- clamp(first_nt_from(chars,min(fwr2_ss,n)), last_nt_to(chars,min(165L,n)))
-        cdr2_ss <- if(fwr2[2L]>0L) fwr2[2L]+1L else 166L
-        cdr2 <- clamp(first_nt_from(chars,min(cdr2_ss,n)), last_nt_to(chars,min(195L,n)))
-        fwr3_ss <- if(cdr2[2L]>0L) cdr2[2L]+1L else 196L
-        fwr3 <- clamp(first_nt_from(chars,min(fwr3_ss,n)), last_nt_to(chars,min(312L,n)))
+        clamp <- function(sg, eg) {
+          s <- if (is.na(sg) || sg < 0L) -1L else as.integer(.ung_ai(sg))
+          e <- if (is.na(eg) || eg < 0L) -1L else as.integer(.ung_ai(eg))
+          if (s != -1L && e != -1L && s > e) { s <- -1L; e <- -1L }
+          c(s, e)
+        }
+        # Compute boundaries in GAPPED coords, convert to UNGAPPED via clamp()
+        fwr1_g <- c(first_nt_from(chars,1L), last_nt_to(chars,min(fe,n)))
+        fwr1   <- clamp(fwr1_g[1L], fwr1_g[2L])
+        cdr1_g <- c(first_nt_from(chars,min(fe+1L,n)), last_nt_to(chars,min(114L,n)))
+        cdr1   <- clamp(cdr1_g[1L], cdr1_g[2L])
+        fwr2_ss <- if(!is.na(cdr1_g[2L])&&cdr1_g[2L]>0L) cdr1_g[2L]+1L else 115L
+        fwr2_g  <- c(first_nt_from(chars,min(fwr2_ss,n)), last_nt_to(chars,min(165L,n)))
+        fwr2    <- clamp(fwr2_g[1L], fwr2_g[2L])
+        cdr2_ss <- if(!is.na(fwr2_g[2L])&&fwr2_g[2L]>0L) fwr2_g[2L]+1L else 166L
+        cdr2_g  <- c(first_nt_from(chars,min(cdr2_ss,n)), last_nt_to(chars,min(195L,n)))
+        cdr2    <- clamp(cdr2_g[1L], cdr2_g[2L])
+        fwr3_ss <- if(!is.na(cdr2_g[2L])&&cdr2_g[2L]>0L) cdr2_g[2L]+1L else 196L
+        fwr3_g  <- c(first_nt_from(chars,min(fwr3_ss,n)), last_nt_to(chars,min(312L,n)))
+        fwr3    <- clamp(fwr3_g[1L], fwr3_g[2L])
         nm <- names(v_seqs)[i]
         base_nm <- sub("(\\*\\d+)_.*$","\\1", nm)
         row1 <- data.table(gene=nm,
@@ -424,13 +471,42 @@ if (isTRUE(opt$as_is_ids)) {
                              ndm_rows_ai$chain_type[r], ndm_rows_ai$trailing[r]),
                            collapse="\t"), con_ndm)
       }
-      close(con_ndm)
       # Copy to internal_data/
       int_dir <- file.path(opt$outdir, "internal_data", opt$species)
       if (dir.exists(int_dir)) {
         int_nm <- file.path(int_dir, paste0(opt$species, ".ndm.imgt"))
         file.copy(ndm_path_ai, int_nm, overwrite=TRUE)
       }
+      # ── Append reference V entries missing from hybrid ndm ──────────────
+      # V genes removed by sequence dedup won't have ndm entries. Read the
+      # reference ndm and append any gene bases not already covered.
+      ref_ndm_path <- NULL
+      for (cand in c(
+          file.path(opt$igdata, "internal_data", opt$species,
+                    paste0(opt$species, ".ndm.imgt")),
+          file.path(dirname(opt$igdata), "internal_data", opt$species,
+                    paste0(opt$species, ".ndm.imgt")))) {
+        if (file.exists(cand)) { ref_ndm_path <- cand; break }
+      }
+      if (!is.null(ref_ndm_path)) {
+        ref_ndm_lines <- readLines(ref_ndm_path)
+        # Gene bases already written
+        written_genes <- sub("[*\t].*$", "", ndm_rows_ai$gene)
+        n_ref_added <- 0L
+        for (ln in ref_ndm_lines) {
+          gene_nm <- strsplit(ln, "\t")[[1L]][1L]
+          gene_base <- sub("[*].*$", "", gene_nm)
+          if (!gene_base %in% written_genes && !is.na(gene_base) && nchar(gene_base) > 0L) {
+            writeLines(ln, con_ndm)
+            written_genes <- c(written_genes, gene_base)
+            n_ref_added <- n_ref_added + 1L
+          }
+        }
+        if (n_ref_added > 0L)
+          cat(sprintf("  [NDM] Appended %d reference V entries not in hybrid FASTAs\n",
+                      n_ref_added))
+      }
+      close(con_ndm)
       cat(sprintf("  Wrote ndm.imgt: %s (%d V genes)\n",
                   ndm_path_ai, nrow(ndm_rows_ai)))
     }
@@ -2202,17 +2278,25 @@ cat(sprintf("  Wrote aux file: %s\n", aux_path))
 # Format (13 tab-delimited columns, no header):
 #   gene  fwr1s  fwr1e  cdr1s  cdr1e  fwr2s  fwr2e  cdr2s  cdr2e  fwr3s  fwr3e  chain_type  0
 #
-# All positions are 1-based GAPPED nucleotide positions (each character in the
-# IMGT-gapped sequence = 1 position, whether a real nucleotide or a gap dot).
-# Positions are found by scanning the gapped sequence directly for the last/first
-# real nucleotide within each IMGT region, in gapped-nt coordinates.
+# CRITICAL: all positions are UNGAPPED nucleotide counts (i.e. count only
+# real A/C/G/T characters, not gap dots or dashes).
+# igblastn aligns the ungapped query sequence and looks up positions in the
+# ndm.imgt by counting non-gap characters — gapped positions would cause
+# FWR3 to end ~18-24 nt too late, truncating CDR3 extraction.
 #
-# IMGT aa boundaries (1-based aa positions, each aa = 3 gapped nt chars):
-#   FWR1: aa 1-25   (gapped nt 1-75)   [VH uses 25 aa; VK/VL use 26 aa = 78 nt]
-#   CDR1: variable length (starts right after FWR1)
-#   FWR2: fixed end at aa 55 (gapped nt 165)
-#   CDR2: variable
-#   FWR3: ends at aa 104 (gapped nt 312)
+# Algorithm: scan the IMGT-gapped FASTA to find each boundary in gapped
+# coordinates (using IMGT aa position × 3 = gapped nt position), then
+# convert each gapped index to an ungapped count via .ung() before writing.
+#
+# IMGT aa region boundaries (gapped nt search windows):
+#   FWR1: aa 1-25  -> gapped 1-75   (VH); 1-78 (VK/VL, aa 1-26)
+#   CDR1: aa 27-38 -> gapped 76-114  (variable end — scan for last real nt)
+#   FWR2: aa 39-55 -> gapped 115-165
+#   CDR2: aa 56-65 -> gapped 166-195 (variable)
+#   FWR3: aa 66-104-> gapped 196-312 (Cys104 = end of FWR3)
+#
+# Typical UNGAPPED positions for a VH with ~18-24 gaps:
+#   fwr3_stop ~ 288 (= gapped 312 minus ~24 gap chars)
 #
 # Chain type codes: VH (heavy), VK (kappa), VL (lambda)
 # =============================================================================
@@ -2254,9 +2338,19 @@ build_ndm_rows <- function(v_gapped, chain_type, label) {
   # FWR3: from after CDR2 to aa 104 = char 312
   fwr3_end_char  <- 312L
 
-  clamp2 <- function(s, e) {
-    s <- if (is.na(s)) -1L else as.integer(s)
-    e <- if (is.na(e)) -1L else as.integer(e)
+  # .ung(): convert a gapped character index (1-based, counting gap chars) to
+  # the number of non-gap nucleotides up to and including that position.
+  # igblastn ndm.imgt requires UNGAPPED positions — count only real nt chars.
+  # Gap characters are: . (IMGT) - (dash) = (equals)
+  .ung <- function(gapped_idx, chars) {
+    if (is.na(gapped_idx) || gapped_idx < 1L) return(gapped_idx)
+    sum(!chars[seq_len(min(gapped_idx, length(chars)))] %in% c(".","-","="))
+  }
+
+  clamp2 <- function(s_g, e_g, chars) {
+    # Convert gapped positions to ungapped, then clamp
+    s <- if (is.na(s_g) || s_g < 0L) -1L else as.integer(.ung(s_g, chars))
+    e <- if (is.na(e_g) || e_g < 0L) -1L else as.integer(.ung(e_g, chars))
     if (s != -1L && e != -1L && s > e) { s <- -1L; e <- -1L }
     c(s, e)
   }
@@ -2265,28 +2359,33 @@ build_ndm_rows <- function(v_gapped, chain_type, label) {
     chars <- strsplit(as.character(v_gapped[[i]]), "")[[1L]]
     n     <- length(chars)
 
-    # FWR1: chars 1 to fwr1_end_char
-    fwr1 <- clamp2(first_nt_from(chars, 1L),
-                   last_nt_to  (chars, min(fwr1_end_char, n)))
+    # Find boundaries in GAPPED coordinates, then convert to UNGAPPED
+    # (igblastn ndm.imgt requires ungapped nucleotide positions)
+    fwr1_g <- c(first_nt_from(chars, 1L),
+                last_nt_to  (chars, min(fwr1_end_char, n)))
+    fwr1   <- clamp2(fwr1_g[1L], fwr1_g[2L], chars)
 
-    # CDR1: chars fwr1_end_char+1 to cdr1_max_char
-    cdr1 <- clamp2(first_nt_from(chars, min(fwr1_end_char + 1L, n)),
-                   last_nt_to  (chars, min(cdr1_max_char, n)))
+    cdr1_g <- c(first_nt_from(chars, min(fwr1_end_char + 1L, n)),
+                last_nt_to  (chars, min(cdr1_max_char, n)))
+    cdr1   <- clamp2(cdr1_g[1L], cdr1_g[2L], chars)
 
-    # FWR2: first real nt after CDR1 region, to fwr2_end_char
-    fwr2_search_start <- if (cdr1[2L] > 0L) cdr1[2L] + 1L else cdr1_max_char + 1L
-    fwr2 <- clamp2(first_nt_from(chars, min(fwr2_search_start, n)),
-                   last_nt_to  (chars, min(fwr2_end_char, n)))
+    fwr2_search_start <- if (!is.na(cdr1_g[2L]) && cdr1_g[2L] > 0L)
+                           cdr1_g[2L] + 1L else cdr1_max_char + 1L
+    fwr2_g <- c(first_nt_from(chars, min(fwr2_search_start, n)),
+                last_nt_to  (chars, min(fwr2_end_char, n)))
+    fwr2   <- clamp2(fwr2_g[1L], fwr2_g[2L], chars)
 
-    # CDR2: first real nt after FWR2, to cdr2_max_char
-    cdr2_search_start <- if (fwr2[2L] > 0L) fwr2[2L] + 1L else fwr2_end_char + 1L
-    cdr2 <- clamp2(first_nt_from(chars, min(cdr2_search_start, n)),
-                   last_nt_to  (chars, min(cdr2_max_char, n)))
+    cdr2_search_start <- if (!is.na(fwr2_g[2L]) && fwr2_g[2L] > 0L)
+                           fwr2_g[2L] + 1L else fwr2_end_char + 1L
+    cdr2_g <- c(first_nt_from(chars, min(cdr2_search_start, n)),
+                last_nt_to  (chars, min(cdr2_max_char, n)))
+    cdr2   <- clamp2(cdr2_g[1L], cdr2_g[2L], chars)
 
-    # FWR3: first real nt after CDR2, to fwr3_end_char
-    fwr3_search_start <- if (cdr2[2L] > 0L) cdr2[2L] + 1L else cdr2_max_char + 1L
-    fwr3 <- clamp2(first_nt_from(chars, min(fwr3_search_start, n)),
-                   last_nt_to  (chars, min(fwr3_end_char, n)))
+    fwr3_search_start <- if (!is.na(cdr2_g[2L]) && cdr2_g[2L] > 0L)
+                           cdr2_g[2L] + 1L else cdr2_max_char + 1L
+    fwr3_g <- c(first_nt_from(chars, min(fwr3_search_start, n)),
+                last_nt_to  (chars, min(fwr3_end_char, n)))
+    fwr3   <- clamp2(fwr3_g[1L], fwr3_g[2L], chars)
 
     nm       <- names(v_gapped)[i]
     base_nm  <- sub("(\\*\\d+)_.*$", "\\1", nm)   # strip strain tag if present

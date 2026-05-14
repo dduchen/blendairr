@@ -283,11 +283,16 @@ done
 # ---------------------------------------------------------------------------
 header "Locating helper tools"
 
-# Rscript
+# Rscript — priority: --rscript flag > active conda env > PATH
 if [[ -z "$RSCRIPT" ]]; then
-  RSCRIPT="$(command -v Rscript 2>/dev/null || echo "")"
+  if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/Rscript" ]]; then
+    RSCRIPT="${CONDA_PREFIX}/bin/Rscript"
+    ok "Rscript (conda): $RSCRIPT"
+  else
+    RSCRIPT="$(command -v Rscript 2>/dev/null || echo "")"
+  fi
 fi
-[[ -z "$RSCRIPT" ]] && die "Rscript not found. Install R or pass --rscript."
+[[ -z "$RSCRIPT" ]] && die "Rscript not found. Activate a conda env, install R, or use --rscript."
 ok "Rscript: $RSCRIPT"
 
 # edit_imgt_file.pl
