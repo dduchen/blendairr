@@ -58,24 +58,13 @@ ENV IGBLAST_GERMLINES=/opt/igblast/germlines
 RUN pip3 install --no-cache-dir changeo presto
 
 # ---------------------------------------------------------------------------
-# 4. R: configure .libPaths() to include previous R version libraries.
-#    This lets R find packages already installed by the base rocker image
-#    (e.g. from R 4.3.x site-library) without reinstalling them, and makes
-#    the build resilient to minor R version bumps.
-#    Written to Rprofile.site so every Rscript call in this image sees it.
-# ---------------------------------------------------------------------------
-RUN Rscript -e "  r_ver  <- paste(R.version\$major, R.version\$minor, sep='.');   r_maj  <- R.version\$major;   # Candidate previous-version library paths (site and user variants)
-  cands  <- c(     sprintf('/usr/local/lib/R/library'),                        sprintf('/usr/lib/R/library'),                              sprintf('/usr/local/lib/R/site-library'),                   sprintf('/home/%s/R/x86_64-pc-linux-gnu-library', Sys.getenv('USER')),     sprintf('/root/R/x86_64-pc-linux-gnu-library/%s', r_ver),     sprintf('/usr/local/lib/R/site-library')                  );   existing <- unique(c(.libPaths(), cands[dir.exists(cands)]));   lib_line <- paste0('.libPaths(c(',     paste0('"', existing, '"', collapse=','),     '))');   rprofile <- file.path(R.home('etc'), 'Rprofile.site');   write(lib_line, rprofile, append=TRUE);   message('Rprofile.site updated with ', length(existing), ' library paths:');   message(paste(' ', existing, collapse='
-'))"
-
-# ---------------------------------------------------------------------------
-# 5. R: install pak — resolves the full dependency graph automatically,
+# 4. R: install pak — resolves the full dependency graph automatically,
 #    installs packages in the correct order, and handles binary vs source.
 # ---------------------------------------------------------------------------
 RUN Rscript -e "  install.packages('pak', repos='https://cloud.r-project.org');   stopifnot(requireNamespace('pak', quietly=TRUE));   message('pak ', packageVersion('pak'), ' ready')"
 
 # ---------------------------------------------------------------------------
-# 6. R: Bioconductor dependencies via pak
+# 5. R: Bioconductor dependencies via pak
 # ---------------------------------------------------------------------------
 RUN Rscript -e "\
   pak::pkg_install(c( \
@@ -86,7 +75,7 @@ RUN Rscript -e "\
   ), ask=FALSE)"
 
 # ---------------------------------------------------------------------------
-# 7. R: devtools and alakazam/tigger via pak
+# 6. R: devtools and alakazam/tigger via pak
 #    pak resolves the entire graph (fs, bslib, ragg, etc.) automatically
 # ---------------------------------------------------------------------------
 RUN Rscript -e "\
@@ -95,7 +84,7 @@ RUN Rscript -e "\
   message('devtools ', packageVersion('devtools'), ' ready')"
 
 # ---------------------------------------------------------------------------
-# 8. R: remaining blendAIRR runtime dependencies
+# 7. R: remaining blendAIRR runtime dependencies
 # ---------------------------------------------------------------------------
 RUN Rscript -e "\
   pak::pkg_install(c( \
@@ -106,7 +95,7 @@ RUN Rscript -e "\
   ), ask=FALSE)"
 
 # ---------------------------------------------------------------------------
-# 9. PIgLET — copied directly from a pre-built local R library.
+# 8. PIgLET — copied directly from a pre-built local R library.
 #
 #    This avoids all compilation and Bitbucket auth issues.
 #    The compiled package (including piglet.so) is copied verbatim into
@@ -128,7 +117,7 @@ RUN Rscript -e "\
   message('PIgLET OK: ', packageVersion('piglet'))"
 
 # ---------------------------------------------------------------------------
-# 10. Verify all required packages load
+# 9. Verify all required packages load
 # ---------------------------------------------------------------------------
 RUN Rscript -e "\
   pkgs <- c('piglet','Biostrings','DECIPHER','data.table','optparse', \
@@ -138,7 +127,7 @@ RUN Rscript -e "\
   message('All R packages OK')"
 
 # ---------------------------------------------------------------------------
-# 11. Install blendAIRR scripts
+# 10. Install blendAIRR scripts
 # ---------------------------------------------------------------------------
 COPY build_hybrid_igblast_ref.sh   /usr/local/bin/build_hybrid_igblast_ref
 COPY R/piglet_annotate_and_build.R /opt/blendAIRR/R/piglet_annotate_and_build.R
@@ -148,14 +137,14 @@ RUN chmod +x /usr/local/bin/build_hybrid_igblast_ref
 ENV HYBRID_IGBLAST_R_SCRIPT=/opt/blendAIRR/R/piglet_annotate_and_build.R
 
 # ---------------------------------------------------------------------------
-# 12. Final smoke-test
+# 11. Final smoke-test
 # ---------------------------------------------------------------------------
 RUN igblastn -version && \
     Rscript -e "library(piglet); cat('piglet', as.character(packageVersion('piglet')), '\n')" && \
     ls /opt/igblast/germlines/imgt/ | head -3
 
 # ---------------------------------------------------------------------------
-# 13. Entry point
+# 12. Entry point
 # ---------------------------------------------------------------------------
 WORKDIR /data
 
