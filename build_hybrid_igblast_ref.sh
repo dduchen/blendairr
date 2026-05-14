@@ -648,35 +648,63 @@ else
   fi
 
   # Constant regions
-  if ! $SKIP_CONSTANT && [[ -n "$REF_CONST_DIR" ]]; then
+  if ! $SKIP_CONSTANT; then
     info "Building constant region database..."
     CONST_FASTA="$FASTA_DIR/${ORGANISM}_C.fasta"
     : > "$CONST_FASTA"
-    for const_file in \
-        "$REF_CONST_DIR/imgt_${SPECIES}_IGHC.fasta" \
-        "$REF_CONST_DIR/imgt_${SPECIES}_IGKC.fasta" \
-        "$REF_CONST_DIR/imgt_${SPECIES}_IGLC.fasta" \
-        "$REF_CONST_DIR/"*IGHC.fasta \
-        "$REF_CONST_DIR/"*IGKC.fasta \
-        "$REF_CONST_DIR/"*IGLC.fasta; do
-      [[ -f "$const_file" ]] || continue
-      if [[ -n "$EDIT_IMGT" ]]; then
-        perl "$EDIT_IMGT" "$const_file" >> "$CONST_FASTA"
-      else
-        awk '/^>/{sub(/ .*/,""); print} !/^>/{gsub(/\./,""); print}' \
-          "$const_file" >> "$CONST_FASTA"
+    # Use constant FASTAs written by R (already name-deduped and header-cleaned).
+    # Fall back to raw reference files only if R output not present.
+    GAPPED_DIR="$OUTDIR/germlines/gapped"
+    _used_r_output=false
+    for _locus in IGHC IGKC IGLC; do
+      _r_fa="${GAPPED_DIR}/imgt_${ORGANISM}_${_locus}.fasta"
+      if [[ -f "$_r_fa" ]]; then
+        if [[ -n "$EDIT_IMGT" ]]; then
+          perl "$EDIT_IMGT" "$_r_fa" >> "$CONST_FASTA"
+        else
+          awk '/^>/{sub(/ .*/,""); print} !/^>/{gsub(/\./, ""); print}' \
+            "$_r_fa" >> "$CONST_FASTA"
+        fi
+        _used_r_output=true
       fi
     done
-    # Deduplicate sequences by name
-    if command -v seqkit &>/dev/null; then
-      seqkit rmdup "$CONST_FASTA" -o "${CONST_FASTA}.dedup" && \
-        mv "${CONST_FASTA}.dedup" "$CONST_FASTA"
+    # Fallback: raw reference constant FASTAs; awk-dedup handles any duplicates
+    if ! $_used_r_output && [[ -n "$REF_CONST_DIR" ]]; then
+      warn "R constant FASTAs not found; using raw reference files (will dedup)"
+      _seen_const=""
+      for _const_file in \
+          "$REF_CONST_DIR/imgt_${SPECIES}_IGHC.fasta" \
+          "$REF_CONST_DIR/imgt_${SPECIES}_IGKC.fasta" \
+          "$REF_CONST_DIR/imgt_${SPECIES}_IGLC.fasta"; do
+        [[ -f "$_const_file" ]] || continue
+        _real=$(realpath "$_const_file" 2>/dev/null || echo "$_const_file")
+        [[ "$_seen_const" == *"$_real"* ]] && continue
+        _seen_const="$_seen_const:$_real"
+        if [[ -n "$EDIT_IMGT" ]]; then
+          perl "$EDIT_IMGT" "$_const_file" >> "$CONST_FASTA"
+        else
+          awk '/^>/{sub(/ .*/,""); print} !/^>/{gsub(/\./, ""); print}' \
+            "$_const_file" >> "$CONST_FASTA"
+        fi
+      done
     fi
+    # Deduplicate by sequence name using awk — no seqkit required.
+    # The glob pattern above can match the same file twice (explicit + wildcard),
+    # so we always dedup before passing to makeblastdb (which errors on dups).
     if [[ -s "$CONST_FASTA" ]]; then
-      makeblastdb -parse_seqids -dbtype nucl \
-        -in  "$CONST_FASTA" \
-        -out "$db_dir/${ORGANISM}_C" \
-        2>&1 | tee -a "$OUTDIR/logs/makeblastdb.log"
+      awk '
+        /^>/ {
+          id = $0; sub(/ .*/, "", id)
+          if (seen[id]++) { skip=1 } else { skip=0; print }
+          next
+        }
+        !skip { print }
+      ' "$CONST_FASTA" > "${CONST_FASTA}.dedup" &&         mv "${CONST_FASTA}.dedup" "$CONST_FASTA"
+
+      n_const_seqs=$(grep -c "^>" "$CONST_FASTA" || echo 0)
+      info "Constant FASTA: ${n_const_seqs} unique sequences"
+
+      makeblastdb -parse_seqids -dbtype nucl         -in  "$CONST_FASTA"         -out "$db_dir/${ORGANISM}_C"         2>&1 | tee -a "$OUTDIR/logs/makeblastdb.log"
       ok "Built constant region DB: $db_dir/${ORGANISM}_C"
     else
       warn "Constant region FASTA empty; skipping DB build"
@@ -1577,6 +1605,26 @@ echo "--- Combined BLAST databases (ig_v / ig_d / ig_j) ---"
 _build_combined_db "ig_v" IGHV IGKV IGLV
 _build_combined_db "ig_d" IGHD
 _build_combined_db "ig_j" IGHJ IGKJ IGLJ
+
+# ── 6b. Constant region BLAST database ──────────────────────────────────────
+echo ""
+echo "--- constant region BLAST database ---"
+# SRC_DB is baked in at generation time (absolute path to database/ dir)
+SRC_C_DB="${SRC_DB}/${ORGANISM}_C"
+DB_DEST_C="${IGDATA_TARGET}/database"
+if ls "${SRC_C_DB}".n?? &>/dev/null 2>&1; then
+  mkdir -p "$DB_DEST_C"
+  for ext in nhr nin nsq nsi nsd nog; do
+    [[ -f "${SRC_C_DB}.${ext}" ]] && safe_copy "${SRC_C_DB}.${ext}" "$DB_DEST_C" "${ORGANISM}_C.${ext}"
+  done
+  # Also copy the source FASTA (sits alongside the database files)
+  SRC_C_FASTA="${SRC_DB}/../fasta/${ORGANISM}_C.fasta"
+  [[ -f "$SRC_C_FASTA" ]] &&     safe_copy "$SRC_C_FASTA" "${GERMLINES_ROOT}/imgt/${ORGANISM}/constant" "${ORGANISM}_C.fasta"
+  echo -e "${GREEN}[OK]${NC}  Constant region database installed: ${IGDATA_TARGET}/database/${ORGANISM}_C"
+else
+  echo -e "${YELLOW}[WARN]${NC} Constant region BLAST database not found (was --skip_constant used?): ${SRC_C_DB}"
+  echo -e "${YELLOW}[WARN]${NC}   igblastn -c_region_db will not be available for ${ORGANISM}"
+fi
 
 # ── 7. Auxiliary file -> optional_file/
 echo ""

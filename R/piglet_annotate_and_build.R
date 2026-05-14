@@ -136,6 +136,9 @@ if (isTRUE(opt$as_is_ids)) {
     cat(sprintf("Organism   : %s\n", file_prefix))
 
     loci <- c("IGHV","IGHD","IGHJ","IGKV","IGKJ","IGLV","IGLJ")
+    # Constant loci are handled separately — they are copied from reference
+    # with name deduplication but no seq-dedup (all constant alleles are kept).
+    const_loci <- c("IGHC","IGKC","IGLC")
 
     for (locus in loci) {
       # ── Find custom input FASTA ────────────────────────────────────────
@@ -234,6 +237,39 @@ if (isTRUE(opt$as_is_ids)) {
       out_fa <- file.path(gapped_dir, paste0(imgt_file_prefix, "_", locus, ".fasta"))
       Biostrings::writeXStringSet(seqs, out_fa)
     }
+    # ── Constant region FASTAs: deduplicate by name, write to gapped/ ───────
+    cat("\n--- Constant region sequences (from reference, name-deduped) ---\n")
+    for (locus in const_loci) {
+      ref_fa <- Filter(file.exists, c(
+        file.path(opt$ref_dir, paste0("imgt_", opt$species, "_", locus, ".fasta")),
+        file.path(opt$ref_dir, paste0(opt$species, "_", locus, ".fasta")),
+        file.path(opt$ref_dir, paste0(locus, ".fasta"))))[1L]
+      if (is.na(ref_fa)) {
+        cat(sprintf("  [SKIP] %s: no reference FASTA found\n", locus)); next
+      }
+      seqs <- Biostrings::readDNAStringSet(ref_fa)
+      if (length(seqs) == 0L) {
+        cat(sprintf("  [SKIP] %s: empty FASTA\n", locus)); next
+      }
+      # Strip IMGT pipe-delimited headers to plain allele names
+      nms <- vapply(names(seqs), .parse_imgt_header, character(1L),
+                    USE.NAMES=FALSE)
+      nms <- .truncate_id(nms)
+      names(seqs) <- nms
+      # Name-level deduplication only (keep all constant alleles, just remove dups)
+      n_before <- length(seqs)
+      keep <- !duplicated(nms)
+      seqs <- seqs[keep]
+      n_dup <- n_before - length(seqs)
+      cat(sprintf("  %s: %d sequences", locus, length(seqs)))
+      if (n_dup > 0L) cat(sprintf(" (%d duplicate names removed)", n_dup))
+      cat("\n")
+      gapped_dir <- file.path(opt$outdir, "germlines", "gapped")
+      dir.create(gapped_dir, recursive=TRUE, showWarnings=FALSE)
+      out_fa <- file.path(gapped_dir, paste0(imgt_file_prefix, "_", locus, ".fasta"))
+      Biostrings::writeXStringSet(seqs, out_fa)
+    }
+
     cat("\n=== as-is-ids annotation complete ===\n")
 
     # ── Build aux file from as-is J gene sequences ──────────────────────
