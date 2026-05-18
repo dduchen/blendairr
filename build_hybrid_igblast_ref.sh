@@ -647,6 +647,38 @@ else
     build_db "ALL_J" "$GAPPED_DIR/imgt_${ORGANISM}_ALL_J.fasta" "ALL_J"
   fi
 
+  # Constant segments — build combined ig_c from IGHC + IGKC + IGLC gapped FASTAs
+  # edit_imgt_file.pl is applied to each locus before merging, then a single
+  # makeblastdb is run on the combined output for use with -c_region_db.
+  _build_combined_fasta_db() {
+    local out_label="$1"; shift   # e.g. ig_c
+    local loci=("$@")             # e.g. IGHC IGKC IGLC
+    # Use imgt_ prefix to match reference naming: imgt_hybrid_mouse_ig_c.*
+    local out_fasta="$FASTA_DIR/imgt_${ORGANISM}_${out_label}.fasta"
+    local out_db="$db_dir/imgt_${ORGANISM}_${out_label}"
+    : > "$out_fasta"
+    local found=0
+    for locus in "${loci[@]}"; do
+      local src="$GAPPED_DIR/imgt_${ORGANISM}_${locus}.fasta"
+      [[ -f "$src" ]] || continue
+      if [[ -n "$EDIT_IMGT" ]]; then
+        perl "$EDIT_IMGT" "$src" >> "$out_fasta"
+      else
+        awk '/^>/{sub(/ .*/,""); print} !/^>/{gsub(/\./,""); print}'           "$src" >> "$out_fasta"
+      fi
+      (( found++ )) || true
+    done
+    if [[ $found -eq 0 || ! -s "$out_fasta" ]]; then
+      warn "  No constant FASTAs found for ${out_label}; skipping"
+      return
+    fi
+    # Dedup by name before makeblastdb
+    awk '/^>/{id=$0; sub(/ .*/,"",id); if(seen[id]++){skip=1}else{skip=0;print};next} !skip{print}'       "$out_fasta" > "${out_fasta}.dedup" && mv "${out_fasta}.dedup" "$out_fasta"
+    makeblastdb -parse_seqids -dbtype nucl       -in  "$out_fasta"       -out "$out_db"       2>&1 | tee -a "$OUTDIR/logs/makeblastdb.log"
+    ok "  Built DB: $out_db"
+  }
+  _build_combined_fasta_db "ig_c" IGHC IGKC IGLC
+
   # Constant regions
   if ! $SKIP_CONSTANT; then
     info "Building constant region database..."
@@ -1559,6 +1591,13 @@ _build_combined_db() {
     local fa="${VDJ_SRC}/imgt_${ORGANISM}_${locus}.fasta"
     # Fallback to blendAIRR output dir if not yet installed
     [[ -f "$fa" ]] || fa="${SRC_GAPPED}/imgt_${ORGANISM}_${locus}.fasta"
+    # For constant loci (IGHC/IGKC/IGLC): also check the installed constant/ dir
+    if [[ ! -f "$fa" ]]; then
+      local const_dir="${GERMLINES_ROOT}/imgt/${ORGANISM}/constant"
+      [[ -f "${const_dir}/imgt_${ORGANISM}_${locus}.fasta" ]] &&         fa="${const_dir}/imgt_${ORGANISM}_${locus}.fasta"
+      # Also try the processed fasta from the build output
+      [[ -f "$fa" ]] || fa="${SRC_DB}/../fasta/${ORGANISM}_C.fasta"
+    fi
     if [[ -f "$fa" ]]; then
       cat "$fa" >> "$tmp_merged"
       (( found++ )) || true
@@ -1605,26 +1644,36 @@ echo "--- Combined BLAST databases (ig_v / ig_d / ig_j) ---"
 _build_combined_db "ig_v" IGHV IGKV IGLV
 _build_combined_db "ig_d" IGHD
 _build_combined_db "ig_j" IGHJ IGKJ IGLJ
+_build_combined_db "ig_c" IGHC IGKC IGLC
 
-# ── 6b. Constant region BLAST database ──────────────────────────────────────
+# ── 6b. Copy the pre-built constant DB if _build_combined_db couldn't make one
+#    (e.g. when constant FASTAs aren't yet installed but build output exists)
 echo ""
 echo "--- constant region BLAST database ---"
-# SRC_DB is baked in at generation time (absolute path to database/ dir)
-SRC_C_DB="${SRC_DB}/${ORGANISM}_C"
-DB_DEST_C="${IGDATA_TARGET}/database"
-if ls "${SRC_C_DB}".n?? &>/dev/null 2>&1; then
-  mkdir -p "$DB_DEST_C"
-  for ext in nhr nin nsq nsi nsd nog; do
-    [[ -f "${SRC_C_DB}.${ext}" ]] && safe_copy "${SRC_C_DB}.${ext}" "$DB_DEST_C" "${ORGANISM}_C.${ext}"
+# Check if ig_c db was successfully built by _build_combined_db above
+C_DB_INSTALLED="${IGDATA_TARGET}/database/imgt_${ORGANISM}_ig_c"
+SRC_C_DB="${SRC_DB}/imgt_${ORGANISM}_ig_c"      # from new build
+SRC_C_DB_OLD="${SRC_DB}/${ORGANISM}_C"           # from old build (no imgt_ prefix)
+if ! ls "${C_DB_INSTALLED}".n?? &>/dev/null 2>&1; then
+  # Try new-style pre-built db first, then old-style
+  for _try_db in "$SRC_C_DB" "$SRC_C_DB_OLD"; do
+    if ls "${_try_db}".n?? &>/dev/null 2>&1; then
+      echo -e "${YELLOW}[NOTE]${NC} ig_c not built from FASTAs; copying pre-built: $(basename $_try_db)"
+      mkdir -p "${IGDATA_TARGET}/database"
+      for ext in nhr nin nsq nsi nsd nog ndb njs; do
+        [[ -f "${_try_db}.${ext}" ]] &&           safe_copy "${_try_db}.${ext}" "${IGDATA_TARGET}/database" "imgt_${ORGANISM}_ig_c.${ext}"
+      done
+      break
+    fi
   done
-  # Also copy the source FASTA (sits alongside the database files)
-  SRC_C_FASTA="${SRC_DB}/../fasta/${ORGANISM}_C.fasta"
-  [[ -f "$SRC_C_FASTA" ]] &&     safe_copy "$SRC_C_FASTA" "${GERMLINES_ROOT}/imgt/${ORGANISM}/constant" "${ORGANISM}_C.fasta"
-  echo -e "${GREEN}[OK]${NC}  Constant region database installed: ${IGDATA_TARGET}/database/${ORGANISM}_C"
-else
-  echo -e "${YELLOW}[WARN]${NC} Constant region BLAST database not found (was --skip_constant used?): ${SRC_C_DB}"
-  echo -e "${YELLOW}[WARN]${NC}   igblastn -c_region_db will not be available for ${ORGANISM}"
 fi
+# Copy the processed constant FASTA to constant/ germline dir
+for _try_fa in     "${SRC_DB}/../fasta/imgt_${ORGANISM}_ig_c.fasta"     "${SRC_DB}/../fasta/${ORGANISM}_C.fasta"; do
+  if [[ -f "$_try_fa" ]]; then
+    safe_copy "$_try_fa" "${GERMLINES_ROOT}/imgt/${ORGANISM}/constant"       "imgt_${ORGANISM}_ig_c.fasta"
+    break
+  fi
+done
 
 # ── 7. Auxiliary file -> optional_file/
 echo ""

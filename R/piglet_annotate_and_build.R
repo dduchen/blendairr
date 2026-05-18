@@ -240,9 +240,15 @@ if (isTRUE(opt$as_is_ids)) {
     # ── Constant region FASTAs: deduplicate by name, write to gapped/ ───────
     cat("\n--- Constant region sequences (from reference, name-deduped) ---\n")
     for (locus in const_loci) {
+      # Constant FASTAs live in constant/ not vdj/ — search both the constant
+      # subdirectory and common IGDATA germline locations
+      ref_const_dir <- sub("/vdj$", "/constant", opt$ref_dir)
       ref_fa <- Filter(file.exists, c(
+        file.path(ref_const_dir, paste0("imgt_", opt$species, "_", locus, ".fasta")),
+        file.path(ref_const_dir, paste0(opt$species, "_", locus, ".fasta")),
+        file.path(ref_const_dir, paste0(locus, ".fasta")),
+        # Also try vdj/ as fallback in case constant/ isn't separate
         file.path(opt$ref_dir, paste0("imgt_", opt$species, "_", locus, ".fasta")),
-        file.path(opt$ref_dir, paste0(opt$species, "_", locus, ".fasta")),
         file.path(opt$ref_dir, paste0(locus, ".fasta"))))[1L]
       if (is.na(ref_fa)) {
         cat(sprintf("  [SKIP] %s: no reference FASTA found\n", locus)); next
