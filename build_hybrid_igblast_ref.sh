@@ -93,7 +93,7 @@ V_TRIM3=318
 J_TRIM3=40
 LIST_SPECIES=false
 USE_ASC=false
-AS_IS_IDS=false   # skip PIgLET clustering; use input IDs directly
+AS_IS_IDS=true    # default: use input IDs directly (recommended); use --piglet to enable clustering
 CHAIN="all"   # heavy | light | all
 
 # ---------------------------------------------------------------------------
@@ -135,7 +135,8 @@ while [[ $# -gt 0 ]]; do
     --j_trim3)              J_TRIM3="$2";        shift 2 ;;
     --list_species)         LIST_SPECIES=true;   shift ;;
     --asc)                  USE_ASC=true;        shift ;;
-    --as-is-ids)            AS_IS_IDS=true;      shift ;;
+    --as-is-ids)            AS_IS_IDS=true;      shift ;;  # no-op: now the default
+    --piglet)               AS_IS_IDS=false;     shift ;;  # opt-in: enable PIgLET clustering
     --chain)                CHAIN="$2";          shift 2 ;;
     -h|--help)              usage ;;
     *) die "Unknown argument: $1" ;;
@@ -611,8 +612,18 @@ else
       warn "  edit_imgt_file.pl unavailable; used fallback reformatter for $label"
     fi
 
-    # Use the final imgt_ prefixed name directly — no aliases, no renaming needed.
-    # The installed database IS the built database; no path fixups on install.
+    # Deduplicate by sequence ID before makeblastdb — duplicate IDs cause a
+    # fatal error. edit_imgt_file.pl strips headers to the first field, so
+    # two sequences with the same base name (e.g. from different strains that
+    # survived dedup as different gene families) would collide here.
+    local n_before n_after
+    n_before=$(grep -c "^>" "$fasta_out" 2>/dev/null || echo 0)
+    awk '/^>/{id=$0; if(seen[id]++){skip=1}else{skip=0;print};next} !skip{print}' \
+      "$fasta_out" > "${fasta_out}.dedup" && mv "${fasta_out}.dedup" "$fasta_out"
+    n_after=$(grep -c "^>" "$fasta_out" 2>/dev/null || echo 0)
+    [[ "$n_before" -ne "$n_after" ]] && \
+      warn "  Removed $(( n_before - n_after )) duplicate ID(s) from $label FASTA before makeblastdb"
+
     makeblastdb \
       -parse_seqids \
       -dbtype nucl \
@@ -810,6 +821,13 @@ TRANSLATE_PY_EOF
         "$src_fasta" > "$tmp_fasta"
     fi
 
+    # Deduplicate IDs before makeblastdb — edit_imgt_file.pl strips headers to
+    # the first field, so strain-tagged names collapse to the base name and
+    # collide. WITHOUT this dedup the internal_data V database fails to build,
+    # which breaks igblastn chain-type detection (defaults to VH, no light J).
+    awk '/^>/{id=$0; if(seen[id]++){skip=1}else{skip=0;print};next} !skip{print}' \
+      "$tmp_fasta" > "${tmp_fasta}.dedup" && mv "${tmp_fasta}.dedup" "$tmp_fasta"
+
     # Nucleotide BLAST database (n* files)
     makeblastdb -parse_seqids -dbtype nucl \
       -in "$tmp_fasta" -out "$dest_base" \
@@ -880,13 +898,8 @@ header "Step 4: Auxiliary file"
 AUX_SRC="$OUTDIR/auxiliary/${ORGANISM}_gl.aux"
 if [[ -f "$AUX_SRC" ]]; then
   ok "Auxiliary file: $AUX_SRC"
-  AUX_OPT_DIR="$IGDATA/optional_file"
-  if [[ -n "$IGDATA" && -d "$AUX_OPT_DIR" && -w "$AUX_OPT_DIR" ]]; then
-    cp "$AUX_SRC" "$AUX_OPT_DIR/${ORGANISM}_gl.aux"
-    ok "Copied to IGDATA: $AUX_OPT_DIR/${ORGANISM}_gl.aux"
-  else
-    info "IGDATA optional_file not writable; pass aux path explicitly in igblastn call"
-  fi
+  ok "Auxiliary file: $AUX_SRC"
+  info "Use the install script to copy to IGDATA: bash ${PREFIX}_install_to_igdata.sh <IGDATA>"
 else
   warn "Auxiliary file not found (R step may have failed)"
 fi
@@ -920,23 +933,28 @@ OUT_PREFIX="${2:-igblast_out}"
 CHAIN="${3:-all}"    # heavy | light | all
 IGBLAST_EOF
 
-# Bake in resolved paths and species at write time
+# Bake in only the non-path values (organism, prefix); derive paths at runtime
 cat >> "$IGBLAST_CMD" <<IGBLAST_EOF2
 
-# ---- Resolved paths (baked in at build time) ----
-DB_PREFIX="${_ABS_DB}/imgt_${ORGANISM}"
-AUX_FILE="${_ABS_AUX}"
-NDM_FILE="${_ABS_NDM}"
-ORGANISM="${SPECIES}"
-export IGDATA="${_ABS_OUTDIR}"
+# ---- Runtime-resolved paths ----
+# Derive all paths relative to this script's location so the script works
+# whether run from inside a Docker container or copied to the host.
+_SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+ORGANISM="${ORGANISM}"
+DB_PREFIX="\${_SCRIPT_DIR}/database/imgt_${ORGANISM}"
+AUX_FILE="\${_SCRIPT_DIR}/auxiliary/${ORGANISM}_gl.aux"
+NDM_FILE="\${_SCRIPT_DIR}/auxiliary/${ORGANISM}.ndm.imgt"
+# IGDATA: use environment variable if set (installed share dir),
+# otherwise fall back to the build output dir for self-contained use.
+[[ -z "\${IGDATA:-}" ]] && export IGDATA="\${_SCRIPT_DIR}"
 
-# ---- Optional args (set at runtime from baked-in availability) ----
+# ---- Optional args detected at runtime ----
 _IGHD_ARG=""
-ls "${_ABS_DB}/imgt_${ORGANISM}_IGHD".n?? &>/dev/null 2>&1 && \
-    _IGHD_ARG="-germline_db_D ${_ABS_DB}/imgt_${ORGANISM}_IGHD"
+ls "\${DB_PREFIX}_IGHD".n?? &>/dev/null 2>&1 && \
+    _IGHD_ARG="-germline_db_D \${DB_PREFIX}_IGHD"
 _C_ARG=""
-ls "${_ABS_DB}/imgt_${ORGANISM}_C".n?? &>/dev/null 2>&1 && \
-    _C_ARG="-c_region_db ${_ABS_DB}/imgt_${ORGANISM}_C"
+ls "\${_SCRIPT_DIR}/database/imgt_${ORGANISM}_ig_c".n?? &>/dev/null 2>&1 && \
+    _C_ARG="-c_region_db \${_SCRIPT_DIR}/database/imgt_${ORGANISM}_ig_c"
 _NDM_ARG=""
 [[ -f "\${NDM_FILE}" ]] && _NDM_ARG="-custom_internal_data \${NDM_FILE}"
 
@@ -962,8 +980,8 @@ echo "DB       : \${DB_PREFIX}"
 echo "AUX      : \${AUX_FILE}"
 echo "Organism : \${ORGANISM}"
 echo "NDM file : \${NDM_FILE}  \$([[ -n \${_NDM_ARG} ]] && echo '(active)' || echo '(not found - using internal)')"
-[[ -n "\${_IGHD_ARG}" ]] && echo "D db     : ${_ABS_DB}/imgt_${ORGANISM}_IGHD" || echo "D db     : (none)"
-[[ -n "\${_C_ARG}"    ]] && echo "C db     : ${_ABS_DB}/imgt_${ORGANISM}_C"    || echo "C db     : (none)"
+[[ -n "\${_IGHD_ARG}" ]] && echo "D db     : \${_SCRIPT_DIR}/database/imgt_${ORGANISM}_IGHD" || echo "D db     : (none)"
+[[ -n "\${_C_ARG}"    ]] && echo "C db     : \${_SCRIPT_DIR}/database/imgt_${ORGANISM}_C"    || echo "C db     : (none)"
 echo ""
 
 # ---- Diagnostics ----
@@ -1100,8 +1118,8 @@ write_chain_script() {
 #   <makedb_outdir>/*_db-fail.tsv              Sequences failing annotation
 #
 # EMBEDDED PATHS (baked in at build time)
-#   DB prefix : ${_ABS_DB}/${PREFIX}
-#   Aux file  : ${_ABS_AUX}
+#   DB prefix : \${_SCRIPT_DIR}/database/${PREFIX}
+#   Aux file  : \${_SCRIPT_DIR}/auxiliary/${ORGANISM}_gl.aux
 #   IGDATA    : ${_ABS_OUTDIR}
 #   Organism  : ${SPECIES}
 # =============================================================================
@@ -1115,16 +1133,18 @@ OUT_PREFIX="\${2:-igblast_out}"
 MAKEDB_OUTDIR="\${3:-.}"
 
 # Baked-in paths
-export IGDATA="${_ABS_OUTDIR}"
-DB_PREFIX="${_ABS_DB}/imgt_${ORGANISM}"
-AUX_FILE="${_ABS_AUX}"
-NDM_FILE="${_ABS_NDM}"
-ORGANISM="${SPECIES}"
+[[ -z "${IGDATA:-}" ]] && export IGDATA="\${_SCRIPT_DIR}"
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DB_PREFIX="\${_SCRIPT_DIR}/database/imgt_${ORGANISM}"
+AUX_FILE="\${_SCRIPT_DIR}/auxiliary/${ORGANISM}_gl.aux"
+NDM_FILE="\${_SCRIPT_DIR}/auxiliary/${ORGANISM}.ndm.imgt"
+[[ -z "${IGDATA:-}" ]] && export IGDATA="\${_SCRIPT_DIR}"
+IGBLAST_ORGANISM="${ORGANISM}"  # organism name for igblastn -organism flag
 
 _NDM_ARG=""
 [[ -f "\${NDM_FILE}" ]] && _NDM_ARG="-custom_internal_data \${NDM_FILE}"
 _C_ARG=""
-ls "${_ABS_DB}/imgt_${ORGANISM}_C".n?? &>/dev/null 2>&1 && _C_ARG="-c_region_db ${_ABS_DB}/imgt_${ORGANISM}_C"
+ls "\${_SCRIPT_DIR}/database/imgt_${ORGANISM}_ig_c".n?? &>/dev/null 2>&1 && _C_ARG="-c_region_db \${_SCRIPT_DIR}/database/imgt_${ORGANISM}_ig_c"
 
 _LOG="\${OUT_PREFIX}.${chain_label,,}_igblast.log"
 exec > >(tee -a "\${_LOG}") 2>&1
@@ -1142,7 +1162,7 @@ igblastn \\
     ${d_db_arg} \\
     -auxiliary_data "\${AUX_FILE}" \\
     \${_C_ARG} \\
-    -domain_system imgt -ig_seqtype Ig -organism \${ORGANISM} \\
+    -domain_system imgt -ig_seqtype Ig -organism \${IGBLAST_ORGANISM} \\
     \${_NDM_ARG} \\
     -outfmt '7 std qseq sseq btop' \\
     -query  "\${QUERY_FASTA}" \\
@@ -1156,7 +1176,7 @@ igblastn \\
     ${d_db_arg} \\
     -auxiliary_data "\${AUX_FILE}" \\
     \${_C_ARG} \\
-    -domain_system imgt -ig_seqtype Ig -organism \${ORGANISM} \\
+    -domain_system imgt -ig_seqtype Ig -organism \${IGBLAST_ORGANISM} \\
     \${_NDM_ARG} \\
     -outfmt 19 \\
     -query  "\${QUERY_FASTA}" \\
@@ -1200,7 +1220,7 @@ LIGHT_CMD="$OUTDIR/${PREFIX}_run_light.sh"
 write_chain_script "$HEAVY_CMD" "Heavy" "$_IGH_V_ARGS" "$_IGH_D_ARG" "$_IGH_REFS"
 write_chain_script "$LIGHT_CMD" "Light" \
     "-germline_db_V ${_ABS_DB}/imgt_${ORGANISM}_IGKV -germline_db_J ${_ABS_DB}/imgt_${ORGANISM}_IGKJ" \
-    "" \
+    "-germline_db_D ${_ABS_DB}/imgt_${ORGANISM}_ig_d -num_alignments_D 0" \
     "${_ABS_GAPPED}/${ORGANISM}_IGKV.fasta ${_ABS_GAPPED}/${ORGANISM}_IGKJ.fasta ${_ABS_GAPPED}/${ORGANISM}_IGLV.fasta ${_ABS_GAPPED}/${ORGANISM}_IGLJ.fasta"
 
 # Note: light chain script runs IGK only in igblastn; IGL requires a separate invocation.
@@ -1212,11 +1232,12 @@ IGL_PATCH_QUOTED
 cat >> "$LIGHT_CMD" <<IGL_PATCH_BAKED
 echo "--- igblastn IGL fmt7 ---"
 igblastn \\
-    -germline_db_V  "${_ABS_DB}/imgt_${ORGANISM}_IGLV" \\
-    -germline_db_J  "${_ABS_DB}/imgt_${ORGANISM}_IGLJ" \\
+    -germline_db_V  "\${_SCRIPT_DIR}/database/imgt_${ORGANISM}_IGLV" \\
+    -germline_db_J  "\${_SCRIPT_DIR}/database/imgt_${ORGANISM}_IGLJ" \\
+    -germline_db_D  "\${_SCRIPT_DIR}/database/imgt_${ORGANISM}_ig_d" \\
     -auxiliary_data "\${AUX_FILE}" \\
     \${_C_ARG} \\
-    -domain_system imgt -ig_seqtype Ig -organism \${ORGANISM} \\
+    -domain_system imgt -ig_seqtype Ig -num_alignments_D 0 \\
     \${_NDM_ARG} \\
     -outfmt '7 std qseq sseq btop' \\
     -query  "\${QUERY_FASTA}" \\
@@ -1224,11 +1245,12 @@ igblastn \\
 echo "  -> \${OUT_PREFIX}.igl.fmt7"
 echo "--- igblastn IGL AIRR ---"
 igblastn \\
-    -germline_db_V  "${_ABS_DB}/imgt_${ORGANISM}_IGLV" \\
-    -germline_db_J  "${_ABS_DB}/imgt_${ORGANISM}_IGLJ" \\
+    -germline_db_V  "\${_SCRIPT_DIR}/database/imgt_${ORGANISM}_IGLV" \\
+    -germline_db_J  "\${_SCRIPT_DIR}/database/imgt_${ORGANISM}_IGLJ" \\
+    -germline_db_D  "\${_SCRIPT_DIR}/database/imgt_${ORGANISM}_ig_d" \\
     -auxiliary_data "\${AUX_FILE}" \\
     \${_C_ARG} \\
-    -domain_system imgt -ig_seqtype Ig -organism \${ORGANISM} \\
+    -domain_system imgt -ig_seqtype Ig -num_alignments_D 0 \\
     \${_NDM_ARG} \\
     -outfmt 19 \\
     -query  "\${QUERY_FASTA}" \\
@@ -1255,7 +1277,16 @@ cat > "$INSTALL_CMD" <<'INSTALL_EOF_QUOTED'
 #   first to review exactly what would be copied.
 #
 # USAGE
-#   bash <this_script> <IGDATA_DIR> [--dry-run]
+#   bash <this_script> <IGDATA_DIR> [--dry-run] [--src-dir <outdir>]
+#
+# FLAGS
+#   --dry-run          Preview without writing anything
+#   --src-dir <path>   Override baked-in source paths. Required when running
+#                      the install script on the host after a Docker build,
+#                      since the container paths (/data/...) won't exist.
+#                      Example: --src-dir ./data/mrl_ref
+#   --organism-name    Override the organism name (default: hybrid_mouse)
+#   --germlines-root   Override the germlines root directory
 #
 # ARGUMENTS
 #   IGDATA_DIR   Path to your IgBLAST share directory -- the one that contains
@@ -1303,13 +1334,38 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-IGDATA_TARGET="${1:?Usage: $0 <IGDATA_DIR> [--dry-run]}"
+# Parse arguments: first positional is IGDATA, flags can follow in any order
+IGDATA_TARGET=""
 DRY_RUN=false
-[[ "${2:-}" == "--dry-run" ]] && DRY_RUN=true
+FORCE=false
+_SRC_OVERRIDE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)  DRY_RUN=true; shift ;;
+    --force)    FORCE=true;   shift ;;
+    --src-dir)  _SRC_OVERRIDE="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '/^# DESCRIPTION/,/^# ===.*$/p' "$0" | grep '^#' | sed 's/^# \?//'
+      exit 0 ;;
+    -*)         echo "[ERROR] Unknown flag: $1" >&2; exit 1 ;;
+    *)
+      if [[ -z "$IGDATA_TARGET" ]]; then IGDATA_TARGET="$1"; else
+        echo "[ERROR] Unexpected argument: $1" >&2; exit 1
+      fi
+      shift ;;
+  esac
+done
+
+if [[ -z "$IGDATA_TARGET" ]]; then
+  echo "Usage: $0 <IGDATA_DIR> [--dry-run] [--force] [--src-dir <path>]" >&2
+  exit 1
+fi
 
 if [[ ! -d "$IGDATA_TARGET" ]]; then
   echo "[ERROR] IGDATA directory not found: $IGDATA_TARGET" >&2; exit 1
 fi
+
+$FORCE && echo "[FORCE] Existing files will be overwritten and databases rebuilt"
 
 INSTALL_EOF_QUOTED
 
@@ -1317,14 +1373,18 @@ cat >> "$INSTALL_CMD" <<INSTALL_EOF_BAKED
 # Closest reference species (e.g. mouse)
 REF_SPECIES="${SPECIES}"
 # Hybrid organism name used for internal_data/ and igblastn -organism.
-# Defaults to <prefix>_<species> (e.g. hybrid_mouse) to avoid colliding
-# with the existing reference species files in IGDATA.
 ORGANISM="${PREFIX}_${SPECIES}"
-SRC_DB="${_ABS_DB}"
-SRC_GAPPED="${_ABS_GAPPED}"
-SRC_AUX="${_ABS_AUX}"
-SRC_NDM="${_ABS_NDM}"
-SRC_INTERNAL="${_ABS_OUTDIR}/internal_data/${ORGANISM}"
+
+# Source paths derived relative to the install script's own location.
+# This works whether the script is run from inside a Docker container,
+# copied to the host, or moved to a different directory — as long as
+# the blendAIRR output directory structure is intact alongside it.
+_SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+SRC_DB="\${_SCRIPT_DIR}/database"
+SRC_GAPPED="\${_SCRIPT_DIR}/germlines/gapped"
+SRC_AUX="\${_SCRIPT_DIR}/auxiliary/${ORGANISM}_gl.aux"
+SRC_NDM="\${_SCRIPT_DIR}/auxiliary/${PREFIX}_${SPECIES}.ndm.imgt"
+SRC_INTERNAL="\${_SCRIPT_DIR}/internal_data/${PREFIX}_${SPECIES}"
 INSTALL_EOF_BAKED
 
 cat >> "$INSTALL_CMD" <<'INSTALL_EOF_QUOTED2'
@@ -1332,15 +1392,15 @@ cat >> "$INSTALL_CMD" <<'INSTALL_EOF_QUOTED2'
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 n_copied=0; n_skipped=0; n_would=0
 
-while [[ "${1:-}" == --* ]]; do
-  case "$1" in
-    --dry-run)        DRY_RUN=true;                shift ;;
-    --organism-name)  ORGANISM="$2";               shift 2 ;;
-    --germlines-root) GERMLINES_ROOT_OVERRIDE="$2"; shift 2 ;;
-    *) echo "Unknown flag: $1" >&2; exit 1 ;;
-  esac
-done
-# Allow caller to override germlines root location
+# Apply --src-dir override now that ORGANISM/baked paths are defined
+if [[ -n "${_SRC_OVERRIDE:-}" ]]; then
+  SRC_DB="${_SRC_OVERRIDE}/database"
+  SRC_GAPPED="${_SRC_OVERRIDE}/germlines/gapped"
+  SRC_AUX="${_SRC_OVERRIDE}/auxiliary/${ORGANISM}_gl.aux"
+  SRC_NDM="${_SRC_OVERRIDE}/auxiliary/${ORGANISM}.ndm.imgt"
+  SRC_INTERNAL="${_SRC_OVERRIDE}/internal_data/${ORGANISM}"
+  echo "[SRC] Using override source dir: ${_SRC_OVERRIDE}"
+fi# Allow caller to override germlines root location
 [[ -n "${GERMLINES_ROOT_OVERRIDE:-}" ]] && GERMLINES_ROOT_OVERRIDE_SET=true || GERMLINES_ROOT_OVERRIDE_SET=false
 
 echo "=== Installing ${ORGANISM} into ${IGDATA_TARGET} ==="
@@ -1354,17 +1414,21 @@ safe_copy() {
   local src="$1" dest_dir="$2" dest_name="${3:-$(basename "$1")}"
   local dest="${dest_dir}/${dest_name}"
   [[ -f "$src" ]] || { echo -e "${YELLOW}[SKIP]${NC} source missing: $src"; return; }
-  if [[ -e "$dest" ]]; then
+  if [[ -e "$dest" ]] && ! ${FORCE:-false}; then
     echo -e "${YELLOW}[SKIP]${NC} already exists: $dest"
     (( n_skipped++ )) || true; return
   fi
-  if $DRY_RUN; then
-    echo -e "${GREEN}[WOULD COPY]${NC} $src -> $dest"
+  local _action="[WOULD COPY]"
+  [[ -e "$dest" ]] && _action="[WOULD OVERWRITE]"
+  if ${DRY_RUN:-false}; then
+    echo -e "${GREEN}${_action}${NC} $src -> $dest"
     (( n_would++ )) || true
   else
     mkdir -p "$dest_dir"
     cp "$src" "$dest"
-    echo -e "${GREEN}[COPIED]${NC} $dest"
+    local _done="[COPIED]"
+    [[ "$_action" == "[WOULD OVERWRITE]" ]] && _done="[OVERWRITTEN]"
+    echo -e "${GREEN}${_done}${NC} $dest"
     (( n_copied++ )) || true
   fi
 }
@@ -1579,9 +1643,13 @@ _build_combined_db() {
   local out_name="imgt_${ORGANISM}_${seg}"
   local out_db="${DB_DEST}/${out_name}"
 
-  if [[ -e "${out_db}.nhr" ]]; then
+  if [[ -e "${out_db}.nhr" ]] && ! $FORCE; then
     echo -e "${YELLOW}[SKIP]${NC} already exists: ${out_name}.nhr"
     (( n_skipped++ )) || true; return
+  fi
+  if [[ -e "${out_db}.nhr" ]] && $FORCE; then
+    echo -e "${GREEN}[REBUILD]${NC} ${out_name} (--force)"
+    rm -f "${out_db}".n?? "${out_db}".n???  # remove old db files
   fi
 
   # Merge available per-locus FASTAs
@@ -1758,8 +1826,8 @@ echo ""
 echo "  Key outputs:"
 echo "    Gapped FASTAs           : $OUTDIR/germlines/gapped/"
 echo "    BLAST databases         : $OUTDIR/database/"
-echo "    Aux file                : $_ABS_AUX"
-echo "    ndm.imgt                : $_ABS_NDM"
+echo "    Aux file                : ${_ABS_OUTDIR}/auxiliary/${ORGANISM}_gl.aux"
+echo "    ndm.imgt                : ${_ABS_OUTDIR}/auxiliary/${ORGANISM}.ndm.imgt"
 echo "    Annotation tables       : $OUTDIR/annotations/"
 echo "    Heavy chain pipeline    : $HEAVY_CMD"
 echo "    Light chain pipeline    : $LIGHT_CMD"

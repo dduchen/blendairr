@@ -206,16 +206,79 @@ if (isTRUE(opt$as_is_ids)) {
         cat(sprintf("  [WARN] %s: %d name(s) exceed 50 chars and will be truncated\n",
                     locus, sum(too_long)))
         nms <- .truncate_id(nms)
-      }
-      names(seqs) <- nms
 
-      # ── Step 2: sequence-level deduplication (custom seqs take priority) ──
+      }
+      names(seqs) <- nms  # apply parsed/truncated names before dedup
+      # ── Step 2: sequence deduplication with priority rules ──────────────
+      # Priority: OGRDB/custom > IMGT reference
+      # Rules applied in order:
+      #  a) OGRDB sequences are identified (non-IMGT naming, hex-suffix after rename)
+      #  b) Any IMGT sequence identical to an OGRDB sequence is dropped (cross-gene)
+      #     The OGRDB sequence is the MRL-specific allele we want to retain
+      #  c) Among remaining OGRDB sequences, keep unique sequences only (cross-gene)
+      #     Different OGRDB IDs may represent the same sequence
+      #  d) Among remaining IMGT sequences, gene-level dedup: drop sequences
+      #     identical to another allele within the SAME gene family only
+      #     (preserves cross-gene identical sequences as biologically meaningful)
+
       seqs_char <- as.character(seqs)
-      keep_seq  <- !duplicated(seqs_char)
-      n_seq_dup <- sum(!keep_seq)
-      if (n_seq_dup > 0L) {
-        cat(sprintf("  [DEDUP-seq]  %s: %d duplicate sequence(s) removed\n",
-                    locus, n_seq_dup))
+      n_before  <- length(seqs)
+
+      # Classify each sequence as OGRDB (custom novel) or IMGT (reference)
+      # OGRDB alleles after renaming: IGxV[A-Z]{4}*00 pattern
+      # OGRDB novel alleles use family "0-" placeholder: IGKV0-XXXX*00, IGKJ0-XXXX*00
+      is_ogrdb <- grepl("^IG[HKL][VDJ]0-[A-Z0-9]", names(seqs))
+      is_imgt  <- !is_ogrdb
+      ogrdb_seqs <- seqs_char[is_ogrdb]
+      imgt_seqs  <- seqs_char[is_imgt]
+
+      # (b) Drop IMGT sequences identical to any OGRDB sequence (cross-gene)
+      # EXCEPTION: J genes — always retain IMGT J entries even when identical
+      # to an OGRDB entry. igblastn reports the J gene name from the database
+      # and uses it for aux CDR3 anchor lookup. Losing standard IGKJ1-5 entries
+      # means sequences that match those J genes get no J call or wrong anchor.
+      is_j_gene <- grepl("^IG[HKL]J", names(seqs))
+      imgt_drop_cg <- is_imgt & (seqs_char %in% ogrdb_seqs) & !is_j_gene
+      n_imgt_cg_dropped <- sum(imgt_drop_cg)
+
+      # (c) Among OGRDB: drop cross-gene duplicates (keep first = custom priority)
+      ogrdb_dup <- is_ogrdb & duplicated(seqs_char)
+      n_ogrdb_dup <- sum(ogrdb_dup)
+
+      # (d) Among remaining IMGT: gene-level dedup only
+      # J genes are exempt — retain all IMGT J entries regardless of duplication
+      gene_base <- sub("\\*.*$", "", names(seqs))  # strip allele
+      gene_base <- sub("_[^_*]+$", "", gene_base)   # strip strain tag
+      imgt_gene_dup <- logical(length(seqs))
+      seen_per_gene <- list()
+      for (k in seq_along(seqs)) {
+        if (!is_imgt[k] || imgt_drop_cg[k] || ogrdb_dup[k]) next
+        if (is_j_gene[k]) next  # always keep IMGT J genes
+        gene_k <- gene_base[k]
+        seq_k  <- seqs_char[k]
+        if (is.null(seen_per_gene[[gene_k]])) {
+          seen_per_gene[[gene_k]] <- seq_k
+        } else if (seq_k %in% seen_per_gene[[gene_k]]) {
+          imgt_gene_dup[k] <- TRUE
+        } else {
+          seen_per_gene[[gene_k]] <- c(seen_per_gene[[gene_k]], seq_k)
+        }
+      }
+
+      keep_seq <- !(imgt_drop_cg | ogrdb_dup | imgt_gene_dup)
+      n_dropped <- sum(!keep_seq)
+
+      if (n_dropped > 0L) {
+        if (n_imgt_cg_dropped > 0L)
+          cat(sprintf("  [DEDUP] %s: %d IMGT sequence(s) replaced by identical OGRDB allele(s)\n",
+                      locus, n_imgt_cg_dropped))
+        if (n_ogrdb_dup > 0L)
+          cat(sprintf("  [DEDUP] %s: %d OGRDB cross-gene duplicate(s) removed\n",
+                      locus, n_ogrdb_dup))
+        n_gene_dup <- sum(imgt_gene_dup)
+        if (n_gene_dup > 0L)
+          cat(sprintf("  [DEDUP] %s: %d within-gene IMGT duplicate(s) removed\n",
+                      locus, n_gene_dup))
         seqs <- seqs[keep_seq]
         nms  <- names(seqs)
       }
@@ -552,6 +615,31 @@ if (isTRUE(opt$as_is_ids)) {
       cat(sprintf("  Wrote ndm.imgt: %s (%d V genes)\n",
                   ndm_path_ai, nrow(ndm_rows_ai)))
     }
+
+    # ── Write combined ALL_V / ALL_J FASTAs ──────────────────────────────
+    # The internal_data V database (used by igblastn for chain-type detection)
+    # and MakeDb.py both need an all-locus V/J FASTA. Without ALL_V, the bash
+    # Step 3 falls back to IGHV-only, so kappa/lambda queries get aligned only
+    # to heavy V genes internally and are misclassified as VH (no light J call).
+    gapped_dir2 <- file.path(opt$outdir, "germlines", "gapped")
+    combine_loci <- function(loci, out_name) {
+      all_seqs <- NULL
+      for (lc in loci) {
+        fa <- file.path(gapped_dir2, paste0(imgt_file_prefix, "_", lc, ".fasta"))
+        if (file.exists(fa)) {
+          s <- Biostrings::readDNAStringSet(fa)
+          all_seqs <- if (is.null(all_seqs)) s else c(all_seqs, s)
+        }
+      }
+      if (!is.null(all_seqs) && length(all_seqs) > 0L) {
+        out_fa <- file.path(gapped_dir2, paste0(imgt_file_prefix, "_", out_name, ".fasta"))
+        Biostrings::writeXStringSet(all_seqs, out_fa)
+        cat(sprintf("  Wrote %s: %d sequences (%s)\n",
+                    out_name, length(all_seqs), paste(loci, collapse="+")))
+      }
+    }
+    combine_loci(c("IGHV","IGKV","IGLV"), "ALL_V")
+    combine_loci(c("IGHJ","IGKJ","IGLJ"), "ALL_J")
   }
 
   source_as_is()
