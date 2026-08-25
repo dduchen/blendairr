@@ -1400,7 +1400,9 @@ if [[ -n "${_SRC_OVERRIDE:-}" ]]; then
   SRC_NDM="${_SRC_OVERRIDE}/auxiliary/${ORGANISM}.ndm.imgt"
   SRC_INTERNAL="${_SRC_OVERRIDE}/internal_data/${ORGANISM}"
   echo "[SRC] Using override source dir: ${_SRC_OVERRIDE}"
-fi# Allow caller to override germlines root location
+fi
+
+# Allow caller to override germlines root location
 [[ -n "${GERMLINES_ROOT_OVERRIDE:-}" ]] && GERMLINES_ROOT_OVERRIDE_SET=true || GERMLINES_ROOT_OVERRIDE_SET=false
 
 echo "=== Installing ${ORGANISM} into ${IGDATA_TARGET} ==="

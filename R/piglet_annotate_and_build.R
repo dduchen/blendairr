@@ -246,14 +246,16 @@ if (isTRUE(opt$as_is_ids)) {
       n_ogrdb_dup <- sum(ogrdb_dup)
 
       # (d) Among remaining IMGT: gene-level dedup only
-      # J genes are exempt — retain all IMGT J entries regardless of duplication
+      # J genes are exempt from CROSS-gene dedup (retain OGRDB + IMGT J alleles),
+      # but exact duplicates — same sequence AND same name — are still removed
+      # so we never end up with IGKJ1*01 and IGKJ1*01_1 that are byte-identical.
       gene_base <- sub("\\*.*$", "", names(seqs))  # strip allele
       gene_base <- sub("_[^_*]+$", "", gene_base)   # strip strain tag
       imgt_gene_dup <- logical(length(seqs))
       seen_per_gene <- list()
       for (k in seq_along(seqs)) {
         if (!is_imgt[k] || imgt_drop_cg[k] || ogrdb_dup[k]) next
-        if (is_j_gene[k]) next  # always keep IMGT J genes
+        if (is_j_gene[k]) next  # J genes handled below (cross-gene exempt)
         gene_k <- gene_base[k]
         seq_k  <- seqs_char[k]
         if (is.null(seen_per_gene[[gene_k]])) {
@@ -265,7 +267,16 @@ if (isTRUE(opt$as_is_ids)) {
         }
       }
 
-      keep_seq <- !(imgt_drop_cg | ogrdb_dup | imgt_gene_dup)
+      # (e) Exact-duplicate removal for ALL sequences (incl. J genes):
+      # collapse entries where BOTH the name and the sequence are identical.
+      # This is the sequence-level dedup that prevents _1-suffixed clones of
+      # byte-identical J sequences. Distinct-name identical-sequence J entries
+      # (e.g. OGRDB IGKJ0-X vs IMGT IGKJ1*01) are preserved by design.
+      name_seq_key <- paste0(names(seqs), "\u0001", seqs_char)
+      exact_dup <- duplicated(name_seq_key)
+      n_exact_dup <- sum(exact_dup)
+
+      keep_seq <- !(imgt_drop_cg | ogrdb_dup | imgt_gene_dup | exact_dup)
       n_dropped <- sum(!keep_seq)
 
       if (n_dropped > 0L) {
@@ -279,6 +290,9 @@ if (isTRUE(opt$as_is_ids)) {
         if (n_gene_dup > 0L)
           cat(sprintf("  [DEDUP] %s: %d within-gene IMGT duplicate(s) removed\n",
                       locus, n_gene_dup))
+        if (n_exact_dup > 0L)
+          cat(sprintf("  [DEDUP] %s: %d exact duplicate(s) removed (same name + sequence)\n",
+                      locus, n_exact_dup))
         seqs <- seqs[keep_seq]
         nms  <- names(seqs)
       }
