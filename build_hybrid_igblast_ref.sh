@@ -43,6 +43,11 @@
 #                           duplicate names (distinct sequences) are suffixed
 #                           _1, _2 ... (e.g. IGHV1-1*01, IGHV1-1*01_1).
 #   --asc                   Use PIgLET ASC cluster names (e.g. IGHVFx-Gy*01)
+#   --trig_nc               Emit TRIG-NC colon nomenclature (IGHV:01:001:001).
+#                           Implies --asc. Falls back to size-ranked families
+#                           when closest-IMGT-family assignment is unavailable.
+#   --family-threshold N    ASC family clustering threshold (default: 75)
+#   --allele-threshold N    ASC allele clustering threshold (default: 95)
 #                           instead of IMGT-style reference-derived names.
 #
 # OPTIONAL
@@ -83,6 +88,7 @@ INPUT_DIR=""
 OUTDIR=""
 IGDATA="${IGDATA:-}"
 PREFIX="hybrid"
+PREFIX_USER_SET=false
 RSCRIPT=""
 EDIT_IMGT=""
 SKIP_BLAST=false
@@ -93,6 +99,7 @@ V_TRIM3=318
 J_TRIM3=40
 LIST_SPECIES=false
 USE_ASC=false
+USE_TRIG_NC=false
 AS_IS_IDS=true    # default: use input IDs directly (recommended); use --piglet to enable clustering
 CHAIN="all"   # heavy | light | all
 
@@ -124,7 +131,7 @@ while [[ $# -gt 0 ]]; do
     -i|--input_dir)         INPUT_DIR="$2";      shift 2 ;;
     -o|--outdir)            OUTDIR="$2";         shift 2 ;;
     -g|--igdata)            IGDATA="$2";         shift 2 ;;
-    -p|--prefix)            PREFIX="$2";         shift 2 ;;
+    -p|--prefix)            PREFIX="$2"; PREFIX_USER_SET=true; shift 2 ;;
     -r|--rscript)           RSCRIPT="$2";        shift 2 ;;
     -e|--edit_imgt)         EDIT_IMGT="$2";      shift 2 ;;
     --skip_blast)           SKIP_BLAST=true;     shift ;;
@@ -134,7 +141,10 @@ while [[ $# -gt 0 ]]; do
     --v_trim3)              V_TRIM3="$2";        shift 2 ;;
     --j_trim3)              J_TRIM3="$2";        shift 2 ;;
     --list_species)         LIST_SPECIES=true;   shift ;;
-    --asc)                  USE_ASC=true;        shift ;;
+    --asc)                  USE_ASC=true; AS_IS_IDS=false; shift ;;  # ASC requires clustering
+    --trig_nc|--trig-nc)    USE_TRIG_NC=true; USE_ASC=true; AS_IS_IDS=false; shift ;;  # implies --asc + clustering
+    --family-threshold)     FAM_THRESH="$2";     shift 2 ;;
+    --allele-threshold)     ALLELE_THRESH="$2";  shift 2 ;;
     --as-is-ids)            AS_IS_IDS=true;      shift ;;  # no-op: now the default
     --piglet)               AS_IS_IDS=false;     shift ;;  # opt-in: enable PIgLET clustering
     --chain)                CHAIN="$2";          shift 2 ;;
@@ -510,6 +520,17 @@ info "Debug R script written: $DEBUG_R"
 # Format: <prefix>_<species>  e.g. "hybrid_mouse"
 # This replaces the old pattern of PREFIX for databases and PREFIX_SPECIES for aux.
 # ---------------------------------------------------------------------------
+# ASC/TRIG-NC builds use a different naming scheme than standard/as-is builds,
+# so they must not share an organism name in the same IGDATA. When --asc or
+# --trig_nc is used AND the user did NOT set an explicit --prefix, append an
+# "_asc" suffix to the default prefix so the two builds stay separate
+# automatically. An explicit --prefix always takes precedence.
+if { $USE_ASC || $USE_TRIG_NC; } && ! $PREFIX_USER_SET; then
+  PREFIX="${PREFIX}_asc"
+  info "ASC/TRIG-NC mode: using default prefix '${PREFIX}' (organism '${PREFIX}_${SPECIES}')"
+  info "  Override with --prefix if you want a different name."
+fi
+
 ORGANISM="${PREFIX}_${SPECIES}"
 
 # ---------------------------------------------------------------------------
@@ -543,6 +564,7 @@ _run_piglet() {
     --v_trim3prime      "$V_TRIM3" \
     --j_trim3prime      "$J_TRIM3" \
     $($USE_ASC && echo "--use_asc") \
+    $($USE_TRIG_NC && echo "--trig_nc") \
     --organism          "$ORGANISM" \
     2>&1 | tee "$OUTDIR/logs/piglet_annotate.log"
 }
@@ -567,7 +589,13 @@ if $AS_IS_IDS; then
   info "Mode: --as-is-ids (PIgLET clustering skipped)"
   _run_as_is || die "as-is-ids annotation step failed."
 else
-  info "Mode: PIgLET joint clustering (default)"
+  if $USE_TRIG_NC; then
+    info "Mode: PIgLET clustering + TRIG-NC colon nomenclature"
+  elif $USE_ASC; then
+    info "Mode: PIgLET clustering + ASC names"
+  else
+    info "Mode: PIgLET joint clustering"
+  fi
   if ! _run_piglet; then
     warn "PIgLET clustering failed. Retrying in --as-is-ids fallback mode."
     warn "  Original log: $OUTDIR/logs/piglet_annotate.log"
@@ -918,8 +946,6 @@ IGBLAST_CMD="$OUTDIR/${PREFIX}_igblast_cmd.sh"
 _ABS_OUTDIR="$(cd "$OUTDIR" && pwd)"
 _ABS_DB="${_ABS_OUTDIR}/database"
 _ABS_GAPPED="${_ABS_OUTDIR}/germlines/gapped"
-_ABS_AUX="${_ABS_OUTDIR}/auxiliary/${ORGANISM}_gl.aux"
-_ABS_NDM="${_ABS_OUTDIR}/auxiliary/${ORGANISM}.ndm.imgt"
 
 cat > "$IGBLAST_CMD" <<'IGBLAST_EOF'
 #!/usr/bin/env bash
@@ -1073,8 +1099,6 @@ header "Step 6: Generating pipeline scripts"
 _ABS_OUTDIR="$(cd "$OUTDIR" && pwd)"
 _ABS_DB="${_ABS_OUTDIR}/database"
 _ABS_GAPPED="${_ABS_OUTDIR}/germlines/gapped"
-_ABS_AUX="${_ABS_OUTDIR}/auxiliary/${ORGANISM}_gl.aux"
-_ABS_NDM="${_ABS_OUTDIR}/auxiliary/${ORGANISM}.ndm.imgt"
 
 # ---- Helper: write a single-chain igblast+MakeDb script ----
 write_chain_script() {
@@ -1211,8 +1235,6 @@ _IGH_REFS="${_ABS_GAPPED}/${ORGANISM}_IGHV.fasta"
 _IGH_REFS+=" ${_ABS_GAPPED}/${ORGANISM}_IGHJ.fasta"
 
 # Light chain V/J db args and ref FASTAs
-_IGL_V_ARGS="-germline_db_V ${_ABS_DB}/imgt_${ORGANISM}_IGKV -germline_db_J ${_ABS_DB}/imgt_${ORGANISM}_IGKJ -germline_db_V ${_ABS_DB}/imgt_${ORGANISM}_IGLV -germline_db_J ${_ABS_DB}/imgt_${ORGANISM}_IGLJ"
-_IGL_REFS="${_ABS_GAPPED}/${ORGANISM}_IGKV.fasta ${_ABS_GAPPED}/${ORGANISM}_IGKJ.fasta ${_ABS_GAPPED}/${ORGANISM}_IGLV.fasta ${_ABS_GAPPED}/${ORGANISM}_IGLJ.fasta"
 
 HEAVY_CMD="$OUTDIR/${PREFIX}_run_heavy.sh"
 LIGHT_CMD="$OUTDIR/${PREFIX}_run_light.sh"
@@ -1728,7 +1750,7 @@ if ! ls "${C_DB_INSTALLED}".n?? &>/dev/null 2>&1; then
   # Try new-style pre-built db first, then old-style
   for _try_db in "$SRC_C_DB" "$SRC_C_DB_OLD"; do
     if ls "${_try_db}".n?? &>/dev/null 2>&1; then
-      echo -e "${YELLOW}[NOTE]${NC} ig_c not built from FASTAs; copying pre-built: $(basename $_try_db)"
+      echo -e "${GREEN}[OK]${NC}   Installing pre-built ig_c database: imgt_${ORGANISM}_ig_c"
       mkdir -p "${IGDATA_TARGET}/database"
       for ext in nhr nin nsq nsi nsd nog ndb njs; do
         [[ -f "${_try_db}.${ext}" ]] &&           safe_copy "${_try_db}.${ext}" "${IGDATA_TARGET}/database" "imgt_${ORGANISM}_ig_c.${ext}"

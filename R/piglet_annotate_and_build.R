@@ -72,6 +72,8 @@ option_list <- list(
   make_option("--j_trim3prime",             type = "integer", default = 40),
   make_option("--use_asc",                  action = "store_true", default = FALSE,
               help = "Use PIgLET ASC names (IGHVFx-Gy*01) instead of IMGT-style names"),
+  make_option("--trig_nc",                  action = "store_true", default = FALSE,
+              help = "Emit TR/IG Nomenclature Review Committee colon format (IGHV:01:001:001) instead of asterisk format. Requires --use_asc."),
   make_option("--organism",                 type = "character",    default = NULL,
               help = "Organism name used as output file prefix (default: <prefix>_<species>)"),
   make_option("--as_is_ids",                action = "store_true", default = FALSE,
@@ -80,6 +82,8 @@ option_list <- list(
 opt <- parse_args(OptionParser(option_list = option_list))
 for (req in c("custom_dir","ref_dir","outdir","igdata"))
   if (is.null(opt[[req]])) stop(sprintf("--%s is required", req))
+if (isTRUE(opt$trig_nc) && !isTRUE(opt$use_asc))
+  stop("--trig_nc requires --use_asc (TRIG-NC naming operates on ASC clusters)")
 
 for (d in c(opt$outdir,
             file.path(opt$outdir, "germlines","gapped"),
@@ -93,7 +97,12 @@ for (d in c(opt$outdir,
 cat("\n=== Hybrid IgBLAST Reference Builder ===\n")
 cat(sprintf("Custom dir : %s\n", opt$custom_dir))
 cat(sprintf("Reference  : %s  species=%s\n", opt$ref_dir, opt$species))
-cat(sprintf("Naming mode: %s\n", if (isTRUE(opt$use_asc)) "ASC (PIgLET cluster names)" else "IMGT (reference-based)"))
+cat(sprintf("Naming mode: %s\n",
+            if (isTRUE(opt$trig_nc)) "TRIG-NC (colon format, ASC-based)"
+            else if (isTRUE(opt$use_asc)) "ASC (PIgLET cluster names)"
+            else "IMGT (reference-based)"))
+cat(sprintf("ASC thresholds: family=%.0f%%  allele=%.0f%%\n",
+            opt$family_threshold, opt$allele_cluster_threshold))
 
 # file_prefix: used for ALL output file names (FASTAs, databases, aux, ndm.imgt).
 # Defaults to <prefix>_<species> (e.g. "hybrid_mouse") for consistency with the
@@ -106,6 +115,310 @@ file_prefix <- ifelse(!is.null(opt$organism) && nchar(trimws(opt$organism)) > 0,
 imgt_file_prefix <- paste0("imgt_", file_prefix)
 cat(sprintf("File prefix: %s  (gapped FASTAs: %s_*.fasta)\n\n",
             file_prefix, imgt_file_prefix))
+
+# =============================================================================
+# Shared J-gene aux coordinate helpers (used by BOTH as-is and ASC paths)
+# =============================================================================
+
+find_j_anchor <- function(nt_seq, chain_type) {
+  # The conserved J-REGION CDR3 anchor is the Trp/Phe of the [WF]-G-X-G motif
+  # (J-TRP for IGH, J-PHE for IGK/IGL). Use a general regex rather than an
+  # enumerated list so unusual but valid motifs (e.g. FGGG, WGRG) are still
+  # matched. The anchor is the nt position (0-based) of the conserved W/F codon.
+  #
+  # Chain preference for the leading residue:
+  #   IGH -> prefer W (Trp), then F ; IGK/IGL -> prefer F (Phe), then W
+  # We scan all three frames; within a frame we take the FIRST [WF]G.G match.
+  lead <- switch(chain_type, IGH = c("W","F"), IGK = c("F","W"),
+                 IGL = c("F","W"), c("W","F"))
+  seq_obj  <- DNAString(nt_seq)
+  best_pos <- NA_integer_
+  best_motif <- NA_character_
+  for (frame in 0L:2L) {
+    sublen <- nchar(nt_seq) - frame
+    sublen <- sublen - (sublen %% 3L)
+    if (sublen < 3L) next
+    aa <- as.character(translate(subseq(seq_obj, frame+1L, frame+sublen)))
+    # Try preferred lead residue first, then the alternate.
+    for (L in lead) {
+      m <- regexpr(paste0(L, "G.G"), aa)   # e.g. "FG.G" / "WG.G"
+      if (m > 0L) {
+        # (m-1)*3+frame is the 0-based nt start of the W/F codon. The IMGT
+        # reference cdr3_stop convention sits 1 nt earlier (validated against
+        # 25/26 mouse reference J alleles: motif was systematically +1), so
+        # subtract 1 to align exactly with the reference aux.
+        best_pos   <- (m - 1L) * 3L + frame - 1L
+        best_motif <- substr(aa, m, m + attr(m, "match.length") - 1L)  # e.g. "FGGG"
+        break
+      }
+    }
+    if (!is.na(best_pos)) break
+  }
+  # Nucleotide-codon fallback: if no AA protein motif matched (truncated,
+  # divergent, or pseudogene J), locate the conserved anchor codon at the
+  # nucleotide level — Trp (TGG) for IGH, Phe (TTT/TTC) for IGK/IGL. To avoid
+  # grabbing a spurious downstream codon, REQUIRE the anchor codon to be
+  # followed by a Glycine codon (GG[ACGT]) within one codon — reconstructing the
+  # conserved [WF]-G context that the protein motif encodes. Among qualifying
+  # matches, prefer the LAST (3'-most) one, which corresponds to the J-motif.
+  if (is.na(best_pos)) {
+    anchor_codons <- switch(chain_type, IGH = "TGG", IGK = c("TTT","TTC"),
+                            IGL = c("TTT","TTC"), c("TGG","TTT","TTC"))
+    hits <- integer(0L)
+    for (ac in anchor_codons) {
+      # anchor codon immediately followed by a Gly codon (GG.)
+      m <- gregexpr(paste0(ac, "GG."), toupper(nt_seq))[[1L]]
+      if (m[1L] > 0L) hits <- c(hits, m)
+    }
+    if (length(hits) == 0L) {
+      # No [WF]-G context anywhere: fall back to the plain last anchor codon.
+      codon_pat <- paste(anchor_codons, collapse = "|")
+      m <- gregexpr(codon_pat, toupper(nt_seq))[[1L]]
+      if (m[1L] > 0L) hits <- m
+    }
+    if (length(hits) > 0L) {
+      hit_start  <- max(hits)   # 3'-most qualifying anchor codon
+      best_pos   <- as.integer(hit_start - 2L)   # 0-based, -1 IMGT correction
+      codon      <- toupper(substr(nt_seq, hit_start, hit_start + 2L))
+      res        <- if (codon == "TGG") "W" else if (codon %in% c("TTT","TTC")) "F" else "?"
+      best_motif <- paste0(res, "(", codon, ",nt-fallback)")
+    }
+  }
+  # Attach the matched motif so callers can report it (diagnostic only).
+  if (!is.na(best_pos)) attr(best_pos, "motif") <- best_motif
+  best_pos
+}
+`%||%` <- function(a,b) if (!is.null(a)) a else b
+
+#' Build all candidate names to try when looking up a J-gene anchor.
+#' Handles: species-tag suffixes, allele stripping, legacy short names.
+.aux_candidates <- function(gene_name) {
+  # Build all name variants to try when looking up a J gene in the reference aux.
+  # Reference aux uses both IMGT allele names (IGHJ1*01) and legacy short names (JH1).
+  # Novel alleles may have a species-tag suffix: IGKJ1*02_mouse
+  cands     <- gene_name                            # 1. exact
+  no_tag    <- sub("_[^_*]+$", "", gene_name)       # 2. strip _species
+  if (no_tag != gene_name) cands <- c(cands, no_tag)
+  no_allele <- sub("\\*.*$", "", no_tag)           # 3. strip *allele
+  if (no_allele != no_tag) cands <- c(cands, no_allele)
+  # 4. Legacy short-form: IGHJ1->JH1, IGKJ1->JK1, IGLJ1->JL1
+  short <- no_allele
+  short <- sub("^IGHJ(\\d+)$", "JH\\1", short)
+  short <- sub("^IGKJ(\\d+)$", "JK\\1", short)
+  short <- sub("^IGLJ(\\d+)$", "JL\\1", short)
+  if (short != no_allele) cands <- c(cands, short)
+  unique(cands)
+}
+
+lookup_ref_anchor <- function(gene_name, ref_aux_dt, hmap_dt, annot_dt) {
+  if (is.null(ref_aux_dt)) return(NULL)
+
+  # TRIG-NC: the gene_name may be a colon-format name (IGKJ:01:001:001) whose
+  # anchor lives in the reference aux under the original IMGT name (IGKJ1*01).
+  # Resolve colon -> IMGT via the TRIG-NC map before candidate matching.
+  resolved_names <- gene_name
+  if (grepl("^(IG[HKL][VDJ]|TR[ABGD][VDJ]):[0-9]", gene_name) &&
+      exists(".trignc_map_acc", envir = .GlobalEnv)) {
+    tm <- get(".trignc_map_acc", envir = .GlobalEnv)
+    # map: before (IMGT/original) -> after (colon). We want before for this after.
+    origs <- unique(tm[after == gene_name, before])
+    # Keep only IMGT-style origins (skip PIgLET F-names and other colon names)
+    origs <- origs[grepl("^(IG[HKL][VDJ]|TR[ABGD][VDJ])[0-9]", origs)]
+    if (length(origs) > 0L) resolved_names <- c(origs, gene_name)
+  }
+
+  # Try all candidate names derived from every resolved name. Track whether the
+  # match was at the EXACT ALLELE level (name still contains *NN) or only a
+  # coarser gene/legacy level, so the caller can prefer motif search over a
+  # gene-level anchor that may belong to a different allele of the same gene.
+  for (rn in resolved_names) {
+    cands <- .aux_candidates(rn)
+    for (ci in seq_along(cands)) {
+      cand <- cands[ci]
+      hit <- ref_aux_dt[gene == cand]
+      if (nrow(hit) > 0L) {
+        res <- copy(hit[1L])
+        # exact-allele if the matched candidate retains an allele (*NN)
+        res[, .match_level := if (grepl("\\*[0-9]", cand)) "allele" else "gene"]
+        return(res)
+      }
+    }
+  }
+  # Via header normalisation map (normalised_name -> raw_header)
+  if (!is.null(hmap_dt) && nrow(hmap_dt) > 0L) {
+    for (rh in hmap_dt[normalised_name == gene_name, raw_header]) {
+      for (cand in .aux_candidates(rh)) {
+        hit <- ref_aux_dt[gene == cand]
+        if (nrow(hit) > 0L) return(hit[1L])
+      }
+    }
+  }
+  # Via PIgLET annotation table (new_allele -> imgt_allele -> legacy name)
+  if (!is.null(annot_dt) && nrow(annot_dt) > 0L) {
+    for (ia in annot_dt[new_allele == gene_name, imgt_allele]) {
+      for (cand in .aux_candidates(ia)) {
+        hit <- ref_aux_dt[gene == cand]
+        if (nrow(hit) > 0L) return(hit[1L])
+      }
+    }
+  }
+  NULL
+}
+
+# Modal extra_bps among reference J genes of a given chain (IGH/IGK/IGL).
+# Used as the default for NOVEL J genes that have no reference row to inherit
+# from, so they follow the same convention as the reference (typically 1).
+.chain_default_extra_bps <- function(chain_type, ref_aux_dt) {
+  jt <- switch(chain_type, IGH = "JH", IGK = "JK", IGL = "JL", NA_character_)
+  if (!is.na(jt) && !is.null(ref_aux_dt) && "chain_type" %in% names(ref_aux_dt) &&
+      "extra_bps" %in% names(ref_aux_dt)) {
+    # Prefer allele-level entries (names with *) as the comparison class.
+    vals <- ref_aux_dt[chain_type == jt & grepl("[*]", gene), extra_bps]
+    vals <- vals[!is.na(vals)]
+    if (!length(vals)) {
+      vals <- ref_aux_dt[chain_type == jt, extra_bps]; vals <- vals[!is.na(vals)]
+    }
+    if (length(vals) > 0L) {
+      tt <- sort(table(vals), decreasing = TRUE)
+      return(as.integer(names(tt)[1L]))
+    }
+  }
+  1L  # IG J genes conventionally carry extra_bps = 1
+}
+
+# ── Reference J sequence -> curated anchor map (for sequence-identity liftover)
+# Builds a lookup from ungapped reference J sequence to its curated aux anchor,
+# by joining reference J FASTAs (from the --species germlines) to the reference
+# aux by gene name. Enables validating a NOVEL J gene's inferred anchor against
+# the curated anchor of an IDENTICAL reference sequence, even when the names
+# differ (e.g. OGRDB IGKJ0-XXXX*00 identical in sequence to IMGT IGKJ2*01).
+.build_ref_jseq_anchor_map <- function(ref_j_gapped, ref_aux_dt) {
+  if (is.null(ref_j_gapped) || length(ref_j_gapped) == 0L ||
+      is.null(ref_aux_dt) || nrow(ref_aux_dt) == 0L)
+    return(list())
+  ung <- as.character(DECIPHER::RemoveGaps(ref_j_gapped, removeGaps = "all"))
+  nms <- names(ref_j_gapped)
+  m <- list()
+  for (i in seq_along(ung)) {
+    # find this ref gene's curated anchor via name candidates
+    hit <- NULL
+    for (cand in .aux_candidates(nms[i])) {
+      h <- ref_aux_dt[gene == cand]
+      if (nrow(h) > 0L) { hit <- h[1L]; break }
+    }
+    if (!is.null(hit)) {
+      key <- toupper(ung[i])
+      # keep first (allele-level preferred via .aux_candidates ordering)
+      if (is.null(m[[key]]))
+        m[[key]] <- list(stop = as.integer(hit$cdr3_stop),
+                         frame = as.integer(hit$frame),
+                         gene = nms[i])
+    }
+  }
+  m
+}
+
+# ── Shared J-gene aux coordinate derivation ─────────────────────────────────
+# Single source of truth for how a J gene's aux entry (CDR3-stop anchor, coding
+# frame offset, extra_bps) is derived. Used by BOTH the --as-is-ids path and the
+# --asc / --trig_nc path so the coordinates are always computed identically.
+#
+# Priority:
+#   1. Exact-allele reference match  -> authoritative (per-allele cdr3_stop/frame)
+#   2. Motif search on the sequence  -> preferred over a gene-level ref match
+#   3. Gene-level reference match     -> last resort
+#   4. Nothing found                  -> anchor 0, frame 0
+#
+# Relationships used for motif-derived (novel) genes, validated against the IMGT
+# reference aux (holds for all mouse J alleles):
+#   frame     = (cdr3_stop - 2) mod 3
+#   extra_bps = modal extra_bps among allele-level reference J genes of the chain
+#
+# Returns a list: anchor, frame, extra_bps, method, motif_anchor, agrees
+.derive_j_aux <- function(gene, nt, chain_type, ref_aux_dt, hmap_dt = NULL,
+                          annot_dt = NULL, ref_seq_map = NULL) {
+  anchor <- NA_integer_; frame <- 0L; method <- "none"; extra <- NA_integer_
+  motif_anchor <- find_j_anchor(nt, chain_type)
+  motif_str    <- if (!is.na(motif_anchor)) attr(motif_anchor, "motif") else NA_character_
+
+  # ── Priority 0: exact sequence-identity match to a reference J sequence ──
+  # If this J sequence is byte-identical to a reference sequence, that
+  # reference's CURATED anchor is authoritative by definition (same sequence).
+  # This beats motif inference — especially for pseudogenes / atypical J where
+  # motif inference is unreliable. Captured up-front so it takes precedence.
+  seqmatch_stop <- NA_integer_; seqmatch_gene <- NA_character_
+  if (!is.null(ref_seq_map)) {
+    rm <- ref_seq_map[[toupper(nt)]]
+    if (!is.null(rm)) { seqmatch_stop <- rm$stop; seqmatch_gene <- rm$gene }
+  }
+  if (!is.na(seqmatch_stop)) {
+    anchor <- as.integer(seqmatch_stop)
+    frame  <- ((anchor - 2L) %% 3L + 3L) %% 3L
+    extra  <- .chain_default_extra_bps(chain_type, ref_aux_dt)
+    # keep any curated frame/extra from the matched reference row if available
+    hitrow <- if (!is.na(seqmatch_gene)) {
+      h <- NULL
+      for (cand in .aux_candidates(seqmatch_gene)) {
+        hh <- ref_aux_dt[gene == cand]; if (nrow(hh) > 0L) { h <- hh[1L]; break }
+      }; h
+    } else NULL
+    if (!is.null(hitrow)) {
+      frame <- as.integer(hitrow$frame)
+      if ("extra_bps" %in% names(hitrow)) extra <- as.integer(hitrow$extra_bps)
+    }
+    method <- "seq_identity"
+    return(list(anchor = anchor, frame = as.integer(frame),
+                extra_bps = as.integer(extra), method = method, motif = motif_str,
+                motif_anchor = if (is.na(motif_anchor)) NA_integer_ else as.integer(motif_anchor),
+                agrees = if (!is.na(motif_anchor)) abs(motif_anchor - anchor) <= 3L else NA,
+                seqmatch_stop = seqmatch_stop, seqmatch_gene = seqmatch_gene))
+  }
+
+  rh <- lookup_ref_anchor(gene, ref_aux_dt, hmap_dt, annot_dt)
+  match_level <- if (!is.null(rh) && ".match_level" %in% names(rh))
+                   rh$.match_level else if (!is.null(rh)) "allele" else NA_character_
+
+  if (!is.null(rh) && identical(match_level, "allele")) {
+    anchor <- as.integer(rh$cdr3_stop)
+    frame  <- as.integer(rh$frame)
+    if ("extra_bps" %in% names(rh)) extra <- as.integer(rh$extra_bps)
+    method <- "reference_aux(allele)"
+    if (!is.na(motif_anchor) && abs(motif_anchor - anchor) > 3L)
+      message(sprintf("    [CHECK] %s (%s): allele anchor=%d, motif=%d (Δ=%d)",
+                      gene, chain_type, anchor, motif_anchor, motif_anchor - anchor))
+  } else if (!is.na(motif_anchor)) {
+    anchor <- motif_anchor
+    frame  <- ((anchor - 2L) %% 3L + 3L) %% 3L
+    method <- "motif_search"
+    if (!is.null(rh) && "extra_bps" %in% names(rh)) extra <- as.integer(rh$extra_bps)
+  } else if (!is.null(rh)) {
+    anchor <- as.integer(rh$cdr3_stop)
+    frame  <- as.integer(rh$frame)
+    if ("extra_bps" %in% names(rh)) extra <- as.integer(rh$extra_bps)
+    method <- "reference_aux(gene)"
+  } else {
+    message(sprintf("    [WARN] No anchor for %s (%s); defaulting 0", gene, chain_type))
+    anchor <- 0L; frame <- 0L; method <- "default"
+  }
+
+  if (is.na(extra)) extra <- .chain_default_extra_bps(chain_type, ref_aux_dt)
+
+  # Consistent per-gene logging for motif-derived (novel) J genes, used by BOTH
+  # the as-is and ASC/TRIG-NC paths.
+  if (method == "motif_search") {
+    cat(sprintf("  [AUX-motif] %s: motif '%s' -> stop=%d frame=%d extra_bps=%d\n",
+                gene, if (is.na(motif_str)) "?" else motif_str,
+                as.integer(anchor), as.integer(frame), as.integer(extra)))
+  }
+
+  list(anchor = as.integer(anchor), frame = as.integer(frame),
+       extra_bps = as.integer(extra), method = method,
+       motif = motif_str,
+       motif_anchor = if (is.na(motif_anchor)) NA_integer_ else as.integer(motif_anchor),
+       agrees = if (grepl("^reference_aux", method) && !is.na(motif_anchor))
+                  abs(motif_anchor - anchor) <= 3L else NA,
+       seqmatch_stop = seqmatch_stop, seqmatch_gene = seqmatch_gene)
+}
 
 # If --as_is_ids, run the lightweight pipeline and exit early
 if (isTRUE(opt$as_is_ids)) {
@@ -128,6 +441,8 @@ if (isTRUE(opt$as_is_ids)) {
     }
     nms
   }
+
+
 
   source_as_is <- function() {
     cat("\n=== as-is-ids mode: input names used directly, merged with reference ===\n")
@@ -357,6 +672,7 @@ if (isTRUE(opt$as_is_ids)) {
 
     # ── Build aux file from as-is J gene sequences ──────────────────────
     cat("\n--- Building auxiliary file (as-is-ids mode) ---\n")
+    .jaux_val <- list()   # accumulate motif-inference validation rows
     aux_dir <- file.path(opt$outdir, "auxiliary")
     dir.create(aux_dir, recursive=TRUE, showWarnings=FALSE)
     aux_path_ai <- file.path(aux_dir, paste0(file_prefix, "_gl.aux"))
@@ -381,6 +697,31 @@ if (isTRUE(opt$as_is_ids)) {
           break
         }
       }
+    }
+
+    # Build reference-J sequence -> curated anchor map for sequence-identity
+    # liftover validation (now that ref_aux_dt_ai is loaded).
+    .ref_jseq_map <- {
+      rj <- Biostrings::DNAStringSet()
+      for (jl in c("IGHJ","IGKJ","IGLJ")) {
+        rjfa <- Filter(file.exists, c(
+          file.path(opt$ref_dir, paste0("imgt_", opt$species, "_", jl, ".fasta")),
+          file.path(opt$ref_dir, paste0(opt$species, "_", jl, ".fasta")),
+          file.path(opt$ref_dir, paste0(jl, ".fasta"))))[1L]
+        if (!is.na(rjfa)) {
+          s <- tryCatch(Biostrings::readDNAStringSet(rjfa),
+                        error = function(e) Biostrings::DNAStringSet())
+          if (length(s) > 0L) {
+            names(s) <- vapply(names(s), function(h) {
+              if (grepl("\\|", h)) { f <- strsplit(h, "\\|")[[1L]]
+                if (length(f) >= 2L && nzchar(f[2])) f[2] else h } else sub("\\s.*$","",h)
+            }, character(1L))
+            rj <- c(rj, s)
+          }
+        }
+      }
+      if (length(rj) > 0L && !is.null(ref_aux_dt_ai))
+        .build_ref_jseq_anchor_map(rj, ref_aux_dt_ai) else list()
     }
 
     con_aux <- file(aux_path_ai, open="wt")
@@ -409,56 +750,48 @@ if (isTRUE(opt$as_is_ids)) {
       names(j_ung) <- names(j_seqs)
       ct_key  <- sub("J$","",j_locus)            # IGHJ->IGH etc.
       ct_out  <- chain_map_ai[ct_key]
-      # Chain-appropriate CDR3 anchor motifs (IMGT-defined):
-      #   Heavy (JH):  Trp (TGG) at position 118 of the J-REGION
-      #   Kappa (JK):  Phe (TTT|TTC) in FGXG motif
-      #   Lambda (JL): Phe (TTT|TTC) in FGXG motif
-      motif_pat <- switch(ct_key,
-        IGH = "TGG",
-        IGK = "TTT|TTC",
-        IGL = "TTT|TTC",
-        "TGG|TTT|TTC")   # safe fallback
-
       written_j <- character(0L)
       for (i in seq_along(j_ung)) {
         nm  <- names(j_ung)[i]
         nt  <- j_ung[i]
 
-        # ── Lookup from reference aux (tries full name, base name, gene only) ──
-        anchor_val <- frame_val <- extra_val <- NA_integer_
-        if (!is.null(ref_aux_dt_ai)) {
-          base_nm_lookup  <- sub("(\\*\\d+)_.*$", "\\1", nm)   # strip strain tag
-          gene_nm_lookup  <- sub("\\*.*$", "", base_nm_lookup)  # gene only e.g. IGKJ1
-          # Also try the short legacy name: IGKJ1 -> JK1, IGHJ2 -> JH2
-          chain_letter <- sub("^IG([HKL]).*$","\\1", nm)
-          seg_num <- regmatches(nm, regexpr("\\d+", nm))
-          short_nm <- if (length(seg_num)) paste0("J", chain_letter, seg_num) else ""
-          for (cand in c(nm, base_nm_lookup, gene_nm_lookup, short_nm)) {
-            if (nchar(cand) == 0L) next
-            hit <- ref_aux_dt_ai[gene == cand]
-            if (nrow(hit) > 0L) {
-              anchor_val <- hit$cdr3_stop[1L]
-              frame_val  <- hit$frame[1L]
-              extra_val  <- hit$extra_bps[1L]
-              break
-            }
-          }
-        }
+        # ── Derive anchor / frame / extra_bps via the SHARED helper ────────
+        # Same logic used by the ASC/TRIG-NC path: exact-allele reference wins,
+        # else motif search, else gene-level reference. Guarantees identical
+        # coordinate derivation regardless of naming mode.
+        .d <- .derive_j_aux(nm, nt, ct_key, ref_aux_dt_ai,
+                            hmap_dt = NULL, annot_dt = NULL,
+                            ref_seq_map = .ref_jseq_map)
+        anchor_val <- .d$anchor
+        frame_val  <- .d$frame
+        extra_val  <- .d$extra_bps
+        # (.derive_j_aux already logs [AUX-motif] for novel/motif-derived genes)
 
-        # ── Motif fallback using chain-appropriate pattern ─────────────────
-        if (is.na(anchor_val)) {
-          wpos <- gregexpr(motif_pat, nt, ignore.case=TRUE)[[1L]]
-          if (wpos[1L] > 0L) {
-            anchor_val <- wpos[length(wpos)] + 2L   # 0-based inclusive stop
-            frame_val  <- anchor_val %% 3L
-          } else {
-            anchor_val <- 0L; frame_val <- 0L
-          }
-          extra_val <- 0L
-          cat(sprintf("  [AUX-motif] %s: no ref match, used %s motif -> stop=%d\n",
-                      nm, motif_pat, anchor_val))
+        # Accumulate motif-inference validation: for reference-lifted anchors,
+        # record the independent motif result on the same sequence for later
+        # comparison (validates the sequence-only method against ground truth).
+        # Validation row: prefer the sequence-identity reference anchor as the
+        # ground truth when available (works for novel names too); else use the
+        # name-lifted reference anchor. Compare our final anchor + the motif
+        # inference against it.
+        gt_stop <- if (!is.na(.d$seqmatch_stop)) .d$seqmatch_stop
+                   else if (grepl("^reference_aux", .d$method)) as.integer(anchor_val)
+                   else NA_integer_
+        if (!is.na(gt_stop)) {
+          .jaux_val[[length(.jaux_val) + 1L]] <- data.table(
+            gene = nm, chain = ct_out, anchor_method = .d$method,
+            ground_truth = if (!is.na(.d$seqmatch_stop)) "seq_identity" else "name_lift",
+            gt_gene = if (!is.na(.d$seqmatch_gene)) .d$seqmatch_gene else nm,
+            reference_stop = gt_stop,
+            our_stop   = as.integer(anchor_val),
+            motif_stop = as.integer(.d$motif_anchor),
+            delta_our   = as.integer(anchor_val - gt_stop),
+            delta_motif = if (is.na(.d$motif_anchor)) NA_integer_
+                          else as.integer(.d$motif_anchor - gt_stop),
+            agrees_pm1 = abs(anchor_val - gt_stop) <= 1L,
+            motif = if (is.na(.d$motif)) NA_character_ else .d$motif,
+            sequence = nt)
         }
-        if (is.na(extra_val)) extra_val <- 0L
 
         writeLines(paste(nm, frame_val, ct_out,
                          anchor_val, extra_val, sep="\t"), con_aux)
@@ -502,6 +835,39 @@ if (isTRUE(opt$as_is_ids)) {
     close(con_aux)
     cat(sprintf("  Wrote aux: %s (%d total entries)\n",
                 aux_path_ai, length(written_j)))
+
+    # ── J-anchor validation report (sequence-identity ground truth) ──────
+    if (length(.jaux_val) > 0L) {
+      vdt <- rbindlist(.jaux_val, fill = TRUE)
+      n_chk <- nrow(vdt)
+      n_seq <- sum(vdt$ground_truth == "seq_identity", na.rm = TRUE)
+      n_our_ok <- sum(vdt$agrees_pm1, na.rm = TRUE)
+      n_our_ex <- sum(vdt$delta_our == 0L, na.rm = TRUE)
+      # How well does the sequence-only motif method reproduce ground truth?
+      mvals <- vdt$delta_motif[!is.na(vdt$delta_motif)]
+      n_motif_ok <- sum(abs(mvals) <= 1L); n_motif_ex <- sum(mvals == 0L)
+      cat(sprintf("  J-anchor validation vs reference (%d genes; %d via exact sequence identity):\n",
+                  n_chk, n_seq))
+      cat(sprintf("    final anchor  : %d/%d within ±1nt, %d exact\n",
+                  n_our_ok, n_chk, n_our_ex))
+      cat(sprintf("    motif-only    : %d/%d within ±1nt, %d exact\n",
+                  n_motif_ok, length(mvals), n_motif_ex))
+      disc <- vdt[abs(delta_our) > 0L][order(-abs(delta_our))]
+      if (nrow(disc) > 0L) {
+        cat(sprintf("    %d final-anchor discrepancy(ies):\n", nrow(disc)))
+        for (r in seq_len(min(nrow(disc), 20L)))
+          cat(sprintf("      %-22s our=%d vs %s '%s'=%d  Δ=%+d motif='%s'\n",
+                      disc$gene[r], disc$our_stop[r], disc$ground_truth[r],
+                      disc$gt_gene[r], disc$reference_stop[r], disc$delta_our[r],
+                      if (is.na(disc$motif[r])) "?" else disc$motif[r]))
+      }
+      val_out <- file.path(opt$outdir, "annotations",
+                           paste0(opt$prefix, "_jaux_validation.tsv"))
+      dir.create(dirname(val_out), recursive = TRUE, showWarnings = FALSE)
+      fwrite(vdt[order(-abs(delta_our))], val_out, sep = "\t")
+      cat(sprintf("  Wrote J-anchor validation table: %s (%d rows)\n",
+                  val_out, nrow(vdt)))
+    }
 
     # ── Build ndm.imgt from as-is V gene sequences ───────────────────────
     cat("\n--- Building ndm.imgt (as-is-ids mode) ---\n")
@@ -825,6 +1191,219 @@ normalise_name <- function(nm) {
   nm
 }
 
+# ---------------------------------------------------------------------------
+# TRIG-NC (TR/IG Nomenclature Review Committee) colon-format naming
+# ---------------------------------------------------------------------------
+
+#' Uniformly re-derive TRIG-NC names across a MERGED (custom + reference) set.
+#'
+#' Size-ranks ALL genes together within each family so reference IMGT genes and
+#' novel custom genes share one consistent numbering. Policy:
+#'   - FAMILY: lifted from the IMGT name where the sequence already has a
+#'     standard IMGT family (IGHV1-.. -> family 1), else assigned above the
+#'     reference max family (novel families size-ranked, most genes = lowest).
+#'   - GENE: within each family, cluster sequences into genes by the IMGT gene
+#'     base for IMGT-named refs, and by identity for novel/OGRDB names; then
+#'     size-rank those gene clusters (most alleles = gene 1).
+#'   - ALLELE: sequential within each gene.
+#'
+#' @param merged_seqs DNAStringSet of the merged custom+reference sequences
+#' @param ref_seqs    DNAStringSet of the reference (to compute ref max family)
+#' @param label       locus label for logging
+#' @return DNAStringSet with TRIG-NC colon names
+.trignc_rename_merged <- function(merged_seqs, ref_seqs, label = "", annot = NULL) {
+  if (is.null(merged_seqs) || length(merged_seqs) == 0L) return(merged_seqs)
+  nms <- names(merged_seqs)
+  n   <- length(nms)
+
+  seg_prefix <- {
+    fp <- regmatches(nms[1], regexpr("^(IG[HKL][VDJ]|TR[ABGD][VDJ])", nms[1]))
+    if (length(fp) && nzchar(fp)) fp else sub("^([A-Z]+[VDJ]).*$", "\\1", nms[1])
+  }
+
+  extract_fam <- function(v) suppressWarnings(as.integer(
+    sub("^(?:IG[HKL][VDJ]|TR[ABGD][VDJ])([0-9]+).*$", "\\1", v)))
+
+  # The merged FASTA may carry PIgLET cluster names (IGHVF15-G111*02) rather
+  # than IMGT names. PIgLET F-numbers are internal cluster ids, NOT IMGT
+  # families. Resolve each name to its underlying IMGT allele via the
+  # annotation table (new_allele -> imgt_allele) before extracting the family.
+  imgt_lookup <- character(0L)
+  fam_cluster_to_imgtfam <- integer(0L)   # PIgLET family_cluster -> IMGT family
+  name_to_famcluster     <- character(0L) # sequence name -> family_cluster
+  if (!is.null(annot) && nrow(annot) > 0L &&
+      all(c("imgt_allele","new_allele") %in% names(annot))) {
+    ad0 <- as.data.frame(annot, stringsAsFactors = FALSE)
+    # Map both the PIgLET new_allele AND the imgt_allele to the imgt_allele,
+    # so lookup works whichever name variant is on the sequence.
+    imgt_lookup <- setNames(c(ad0$imgt_allele, ad0$imgt_allele),
+                            c(ad0$new_allele,  ad0$imgt_allele))
+
+    # Build family_cluster -> dominant IMGT family from REFERENCE members.
+    # OGRDB/novel alleles that share a PIgLET family_cluster with reference
+    # alleles inherit that cluster's dominant IMGT family (rank-sorted liftover),
+    # instead of being treated as brand-new families.
+    if ("family_cluster" %in% names(ad0)) {
+      imgt_fam_of <- suppressWarnings(as.integer(
+        sub("^(?:IG[HKL][VDJ]|TR[ABGD][VDJ])([0-9]+)-.*$", "\\1", ad0$imgt_allele)))
+      # only reference rows with a real IMGT family (has a dash) count as evidence
+      is_ref_imgt <- (ad0$source == "reference") & !is.na(imgt_fam_of) &
+                     grepl("^(IG[HKL][VDJ]|TR[ABGD][VDJ])[0-9]+-", ad0$imgt_allele)
+      if (any(is_ref_imgt)) {
+        fc  <- ad0$family_cluster[is_ref_imgt]
+        fam <- imgt_fam_of[is_ref_imgt]
+        # dominant IMGT family per cluster = most frequent
+        split_fam <- split(fam, fc)
+        fam_cluster_to_imgtfam <- vapply(split_fam, function(v) {
+          tt <- sort(table(v), decreasing = TRUE); as.integer(names(tt)[1L])
+        }, integer(1L))
+      }
+      # name -> family_cluster for every allele (both name variants)
+      name_to_famcluster <- setNames(
+        c(as.character(ad0$family_cluster), as.character(ad0$family_cluster)),
+        c(ad0$new_allele, ad0$imgt_allele))
+    }
+  }
+  # For each FASTA name, the IMGT name to lift the family from:
+  resolve_imgt <- function(x) {
+    r <- imgt_lookup[x]
+    ifelse(is.na(r), x, r)
+  }
+  imgt_names <- resolve_imgt(nms)
+
+  # Reference max family (from the reference set, all standard IMGT families)
+  ref_max_fam <- {
+    rf <- extract_fam(resolve_imgt(names(ref_seqs)))
+    rf <- rf[!is.na(rf)]
+    if (length(rf)) max(rf) else 0L
+  }
+
+  # ── Family assignment ────────────────────────────────────────────────────
+  # A name has a liftable IMGT family if it starts with locus + digits, whether
+  # or not it has a dash: both "IGHV1-11*01" and bare "IGHV1" yield family 1.
+  # OGRDB hash names (IGKV0-4HMC*00) have family 0 which is a placeholder, so
+  # treat family 0 as NON-liftable (novel).
+  # Use the RESOLVED IMGT names for family detection, not the PIgLET names.
+  has_family <- grepl("^(IG[HKL][VDJ]|TR[ABGD][VDJ])[0-9]+", imgt_names)
+  fam_raw    <- extract_fam(imgt_names)
+  is_std_imgt <- has_family & !is.na(fam_raw) & fam_raw > 0L
+  fam_num <- ifelse(is_std_imgt, fam_raw, NA_integer_)
+
+  # Rank-sorted liftover for OGRDB/novel names that lack a direct IMGT family
+  # (family 0 placeholder, PIgLET F-names): if the sequence shares a PIgLET
+  # family_cluster with reference IMGT alleles, inherit that cluster's dominant
+  # IMGT family. This collapses the many OGRDB IGKV0-* alleles onto real
+  # families (e.g. cluster 2 -> IGKV4) instead of spawning families 60+.
+  if (length(fam_cluster_to_imgtfam) > 0L && length(name_to_famcluster) > 0L) {
+    still_na <- which(is.na(fam_num))
+    for (i in still_na) {
+      fc <- name_to_famcluster[nms[i]]
+      if (is.na(fc)) fc <- name_to_famcluster[imgt_names[i]]
+      if (!is.na(fc) && !is.na(fam_cluster_to_imgtfam[fc])) {
+        fam_num[i] <- fam_cluster_to_imgtfam[fc]
+      }
+    }
+    n_lifted <- sum(is.na(fam_raw) & !is.na(fam_num))
+    if (n_lifted > 0L)
+      cat(sprintf("  [TRIG-NC] %s: %d OGRDB/novel allele(s) lifted to reference family via family_cluster\n",
+                  label, n_lifted))
+  }
+
+  # PIgLET cluster lookups (by sequence name) for novel grouping.
+  #   family_cluster : 75%-threshold family grouping (novel FAMILY assignment)
+  #   cluster_id     : 95%-threshold allele grouping (novel GENE assignment)
+  fam_cl_lookup  <- character(0L)
+  gene_cl_lookup <- character(0L)
+  if (!is.null(annot) && nrow(annot) > 0L &&
+      all(c("imgt_allele","family_cluster","cluster_id") %in% names(annot))) {
+    ad <- as.data.frame(annot, stringsAsFactors = FALSE)
+    fam_cl_lookup  <- setNames(as.character(ad$family_cluster), ad$imgt_allele)
+    gene_cl_lookup <- setNames(as.character(ad$cluster_id),     ad$imgt_allele)
+  }
+
+  # Gene grouping key:
+  #   - IMGT-named with a dash (IGHV1-11): use the gene base "IGHV1-11"
+  #   - novel/bare: use PIgLET cluster_id (95% allele cluster) when available,
+  #     else fall back to sequence identity.
+  seqs_char <- as.character(DECIPHER::RemoveGaps(merged_seqs, removeGaps = "all"))
+  # Gene grouping keys off the RESOLVED IMGT name. Full IMGT gene names group by
+  # gene base; bare-family / novel names group by PIgLET allele cluster (95%),
+  # falling back to sequence identity.
+  has_dash  <- grepl("^(IG[HKL][VDJ]|TR[ABGD][VDJ])[0-9]+-[0-9]", imgt_names)
+  gene_key <- character(n)
+  for (i in seq_len(n)) {
+    if (has_dash[i]) {
+      gene_key[i] <- sub("[*].*$", "", imgt_names[i])   # IMGT gene base
+    } else {
+      gc <- gene_cl_lookup[nms[i]]
+      if (is.na(gc)) gc <- gene_cl_lookup[imgt_names[i]]
+      gene_key[i] <- if (!is.na(gc) && nzchar(gc)) paste0("gclust:", gc)
+                     else paste0("seqgene:", seqs_char[i])
+    }
+  }
+
+  # Assign novel families to rows with no liftable IMGT family (fam_num is NA):
+  # OGRDB hash (family 0), PIgLET F-cluster names, etc. Group these into
+  # families by PIgLET's family_cluster (the 75% family threshold) so related
+  # novel sequences SHARE a family, rather than each becoming its own family.
+  need_fb <- is.na(fam_num)
+  if (any(need_fb)) {
+    next_fam <- max(c(fam_num[!need_fb], ref_max_fam), 0L, na.rm = TRUE) + 1L
+    # Novel family key: PIgLET family_cluster if available, else the gene_key.
+    fb_famkey <- vapply(which(need_fb), function(i) {
+      fc <- fam_cl_lookup[nms[i]]
+      if (!is.na(fc) && nzchar(fc)) paste0("fclust:", fc) else gene_key[i]
+    }, character(1L))
+    # Size-rank novel families by number of distinct genes (most genes = lowest
+    # new family number).
+    fb_gene <- gene_key[need_fb]
+    fam_gene_counts <- tapply(fb_gene, fb_famkey, function(g) length(unique(g)))
+    fb_order  <- names(sort(fam_gene_counts, decreasing = TRUE))
+    fb_fam_rank <- setNames(next_fam + seq_along(fb_order) - 1L, fb_order)
+    fam_num[need_fb] <- fb_fam_rank[fb_famkey]
+    cat(sprintf("  [TRIG-NC] %s: %d truly-novel allele(s) in %d novel famil%s -> families %d..%d (ref max %d)\n",
+                label, sum(need_fb), length(fb_order),
+                if (length(fb_order)==1L) "y" else "ies",
+                next_fam, next_fam + length(fb_order) - 1L, ref_max_fam))
+  }
+
+  # ── Within each family: size-rank genes, number alleles ──────────────────
+  out <- character(n)
+  for (f in sort(unique(fam_num))) {
+    rows <- which(fam_num == f)
+    keys <- gene_key[rows]
+    gcount <- table(keys)
+    gorder <- names(sort(gcount, decreasing = TRUE))   # most alleles first
+    grank  <- setNames(seq_along(gorder), gorder)
+    actr   <- setNames(integer(length(gorder)), gorder)
+    for (ri in rows) {
+      k <- gene_key[ri]
+      g <- grank[[k]]
+      actr[k] <- actr[k] + 1L
+      out[ri] <- sprintf("%s:%02d:%03d:%03d", seg_prefix, f, g, actr[k])
+    }
+  }
+  # Record the IMGT/original -> TRIG-NC mapping for the provenance table.
+  # `nms` are the names BEFORE conversion (post-merge IMGT/OGRDB names);
+  # `out` are the TRIG-NC colon names. Store globally so the final name map
+  # can join original input ids through to the colon names.
+  if (exists(".trignc_map_acc", envir = .GlobalEnv)) {
+    prev <- get(".trignc_map_acc", envir = .GlobalEnv)
+  } else {
+    prev <- data.table(before = character(0L), after = character(0L), locus = character(0L))
+  }
+  # Record BOTH the on-FASTA name (nms) and the resolved IMGT name (imgt_names)
+  # -> colon (out), so downstream joins can match on either variant.
+  assign(".trignc_map_acc",
+         rbind(prev,
+               data.table(before = nms,        after = out, locus = label),
+               data.table(before = imgt_names,  after = out, locus = label)),
+         envir = .GlobalEnv)
+
+  names(merged_seqs) <- out
+  merged_seqs
+}
+
 #' Convert a DNAStringSet to a NAMED character vector for PIgLET.
 #' This is the critical fix: as.character() alone drops names.
 dss_to_named_vec <- function(seqs) setNames(as.character(seqs), names(seqs))
@@ -959,9 +1538,59 @@ run_piglet <- function(seqs_gapped, trim3 = 318L, mask5 = 0L,
   # Access slots via $ (confirmed working for this PIgLET version)
   act      <- res$alleleClusterTable
   tbl      <- as.data.table(act)
+
+  # Normalise column names across PIgLET versions. The allele-name column has
+  # been variously called: imgt_allele, allele, sample_allele, germline_call,
+  # or the sequence name column. The new-cluster-name column: new_allele,
+  # new_call, or func_group. Detect and rename to canonical names.
+  nms_lower <- tolower(names(tbl))
+  # --- source (input) allele name column -> imgt_allele ---
+  if (!"imgt_allele" %in% names(tbl)) {
+    cand <- c("imgt_allele","allele","sample_allele","germline_call",
+              "gene","seq_name","sequence_id","name")
+    hit  <- cand[cand %in% names(tbl)]
+    if (length(hit) == 0L) hit <- names(tbl)[nms_lower %in% cand]
+    if (length(hit) > 0L) {
+      setnames(tbl, hit[1L], "imgt_allele")
+    } else {
+      # Last resort: use the row names or first character column
+      char_cols <- names(tbl)[vapply(tbl, is.character, logical(1L))]
+      if (length(char_cols) > 0L) setnames(tbl, char_cols[1L], "imgt_allele")
+      else stop(sprintf("run_piglet(%s): cannot find allele-name column in PIgLET output; columns are: %s",
+                        label, paste(names(tbl), collapse=", ")))
+    }
+  }
+  # --- new cluster name column -> new_allele ---
+  if (!"new_allele" %in% names(tbl)) {
+    cand2 <- c("new_allele","new_call","func_group","new_tag","threshold")
+    hit2  <- cand2[cand2 %in% names(tbl)]
+    if (length(hit2) == 0L) hit2 <- names(tbl)[tolower(names(tbl)) %in% cand2]
+    if (length(hit2) > 0L) setnames(tbl, hit2[1L], "new_allele")
+    else tbl[, new_allele := imgt_allele]  # fall back to identity naming
+  }
+  # --- ensure cluster_id / family_cluster exist (used by TRIG-NC sizing) ---
+  if (!"cluster_id" %in% names(tbl)) {
+    cand3 <- c("cluster_id","allele_cluster","cluster","func_group_id")
+    hit3  <- cand3[cand3 %in% names(tbl)]
+    if (length(hit3) > 0L) setnames(tbl, hit3[1L], "cluster_id")
+    else tbl[, cluster_id := .I]
+  }
+  if (!"family_cluster" %in% names(tbl)) {
+    cand4 <- c("family_cluster","family","fam_cluster","subgroup")
+    hit4  <- cand4[cand4 %in% names(tbl)]
+    if (length(hit4) > 0L) setnames(tbl, hit4[1L], "family_cluster")
+    else tbl[, family_cluster := 1L]
+  }
+  if (!"removed_duplicated" %in% names(tbl)) {
+    cand5 <- c("removed_duplicated","is_duplicate","duplicated")
+    hit5  <- cand5[cand5 %in% names(tbl)]
+    if (length(hit5) > 0L) setnames(tbl, hit5[1L], "removed_duplicated")
+    else tbl[, removed_duplicated := FALSE]
+  }
+
+  cat(sprintf("  [PIgLET] %s: table columns = %s\n",
+              label, paste(names(tbl), collapse=", ")))
   tbl[, new_allele := normalise_name(new_allele)]
-  if (!"imgt_allele" %in% names(tbl) && "allele" %in% names(tbl))
-    setnames(tbl, "allele", "imgt_allele")
 
   # Distance matrix for nearest-reference lookup in step 5
   dist_mat <- tryCatch(as.matrix(res$distanceMatrix), error = function(e) NULL)
@@ -1204,13 +1833,18 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
       }
       if (nrow(ref_row) > 0L) {
         extra <- copy(as.data.table(ref_row))
+        # Strip any _dup<N> suffix from the adopted reference name — these are
+        # internal disambiguation tags for identical bare-family ref seqs and
+        # must never appear in output. The TRIG-NC merged rename will re-derive
+        # the final name regardless, but keep the adopted name clean here too.
+        imgt_ref_clean <- sub("_dup[0-9]+$", "", imgt_ref_name)
         extra[, imgt_allele   := dc]
-        extra[, new_allele    := imgt_ref_name]
+        extra[, new_allele    := imgt_ref_clean]
         extra[, piglet_cluster := if ("new_allele" %in% names(ref_row))
                                     ref_row$new_allele[1L] else NA_character_]
         tbl_custom <- rbind(tbl_custom, extra, fill = TRUE)
         message(sprintf("  [INFO] %s: '%s' identical to ref '%s' -> adopts IMGT name",
-                        label, dc, imgt_ref_name))
+                        label, dc, imgt_ref_clean))
         next
       }
     }
@@ -1368,6 +2002,17 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
   # are dropped here). No IMGT-name inference, no DECIPHER, no distance lookup.
   if (isTRUE(opt$use_asc)) {
     tbl_cust[, new_allele_final := normalise_name(new_allele)]
+
+if (isTRUE(opt$trig_nc)) {
+      # TRIG-NC FASTA naming is applied uniformly to the MERGED custom+reference
+      # set in annotate_locus() via .trignc_rename_merged(), so that reference
+      # and novel genes are size-ranked together. Here we only keep the ASC
+      # new_allele in the annotation table for provenance; the authoritative
+      # colon names are assigned downstream on the merged FASTA.
+      cat(sprintf("  [TRIG-NC] %s naming deferred to merged rename (uniform gene sizing)\n",
+                  if (nrow(tbl_cust)) as.character(tbl_cust$imgt_allele[1]) else ""))
+    }
+
     tbl_cust[, new_allele       := new_allele_final]
     drop_cols <- intersect(c("new_allele_final","ref_rep","fam_rep"), names(tbl_cust))
     if (length(drop_cols)) tbl_cust[, (drop_cols) := NULL]
@@ -1517,16 +2162,23 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
     tbl_cust[, ..cols2][, source := "custom"]
   ), fill = TRUE)
 
-  # Final guard: no _dup names should ever reach the output
-  surviving_dups <- full_annot$new_allele[grepl("_dup", full_annot$new_allele,
-                                                 fixed = TRUE)]
-  if (length(surviving_dups) > 0L) {
+  # Strip internal _dup<N> disambiguation tags from all new_allele values.
+  # These arise from identical bare-family reference sequences (e.g. several
+  # ">IGHV1" records) and are never valid output names. In TRIG-NC mode the
+  # merged rename re-derives names anyway; in other modes the base name is the
+  # correct output. Strip rather than error so a clean reference _dup does not
+  # abort the whole run.
+  full_annot[, new_allele := sub("_dup[0-9]+$", "", new_allele)]
+
+  # Guard only for CUSTOM sequences whose name still contains _dup after
+  # stripping the numeric suffix (would indicate a genuine logic error).
+  cust_bad <- full_annot[source == "custom" & grepl("_dup", new_allele, fixed = TRUE)]
+  if (nrow(cust_bad) > 0L) {
     message(sprintf(
-      "  [ERROR] %s: %d _dup name(s) survived into final output: %s",
-      label, length(surviving_dups),
-      paste(head(surviving_dups, 5L), collapse=", ")))
-    stop(sprintf("_dup allele names in final output for locus %s. ",
-                 "This is a bug — please report it."), label)
+      "  [ERROR] %s: %d custom _dup name(s) survived: %s",
+      label, nrow(cust_bad),
+      paste(head(cust_bad$new_allele, 5L), collapse=", ")))
+    stop(sprintf("custom _dup allele names in final output for locus %s.", label))
   }
 
   list(renamed_custom    = renamed_custom,
@@ -1758,8 +2410,10 @@ annotate_locus <- function(nm, trim3) {
   }
   if (is.null(cust)) {
     cat(sprintf("  %s: no custom seqs; reference only\n", nm))
-    return(list(custom_gapped = NULL, ref_gapped = ref,
-                hybrid_gapped = ref, hybrid_ungapped = ungap(ref),
+    ref_use <- ref
+    if (isTRUE(opt$trig_nc)) ref_use <- .trignc_rename_merged(ref, ref, nm)
+    return(list(custom_gapped = NULL, ref_gapped = ref_use,
+                hybrid_gapped = ref_use, hybrid_ungapped = ungap(ref_use),
                 annot = .empty_annot(), dropped = data.table()))
   }
   if (is.null(ref)) {
@@ -1779,7 +2433,25 @@ annotate_locus <- function(nm, trim3) {
                                   fam_thresh    = opt$family_threshold,
                                   allele_thresh = opt$allele_cluster_threshold,
                                   label = nm)
-  hg <- merge_with_priority(res$renamed_custom, ref)
+  # Strip internal _dup<N> tags from reference names before merging. Identical
+  # bare-family reference records (e.g. many ">IGHV1") were disambiguated with
+  # _dup suffixes at load time; those are not valid germline names. After
+  # stripping, collapse any exact name+sequence duplicates that result.
+  ref_clean <- ref
+  rn <- sub("_dup[0-9]+$", "", names(ref_clean))
+  names(ref_clean) <- rn
+  # Drop entries that are now exact name duplicates (keep first)
+  ref_clean <- ref_clean[!duplicated(names(ref_clean))]
+
+  hg <- merge_with_priority(res$renamed_custom, ref_clean)
+  # TRIG-NC: re-derive uniform colon names across the MERGED set so reference
+  # and novel genes are size-ranked TOGETHER within each family (avoids gene
+  # number collisions between IMGT ref genes and size-ranked novel genes).
+  # Pass PIgLET's annotation table so truly-novel sequences are grouped into
+  # families by the 75% family-clustering threshold, not one family each.
+  if (isTRUE(opt$trig_nc)) {
+    hg <- .trignc_rename_merged(hg, ref_clean, nm, annot = res$annot_table)
+  }
   list(custom_gapped    = res$renamed_custom,
        ref_gapped       = ref,
        hybrid_gapped    = hg,
@@ -1792,6 +2464,11 @@ annotate_locus <- function(nm, trim3) {
 }
 
 cat("\n--- V-gene family annotation (joint PIgLET clustering) ---\n")
+# Accumulator for TRIG-NC before->after name mappings (populated by
+# .trignc_rename_merged as each locus is processed).
+assign(".trignc_map_acc",
+       data.table(before = character(0L), after = character(0L), locus = character(0L)),
+       envir = .GlobalEnv)
 V_results <- list()
 for (nm in c("IGHV","IGKV","IGLV")) {
   cat(sprintf("\nProcessing %s...\n", nm))
@@ -1892,10 +2569,51 @@ if (nrow(header_map_dt) > 0L && nrow(combined_annot) > 0L) {
 } else {
   provenance <- copy(header_map_dt)
 }
+
+# Attach the FINAL FASTA name (TRIG-NC colon format when --trig_nc, else the
+# IMGT/ASC name). Join through the TRIG-NC map (normalised IMGT -> colon), so
+# every row — including reference rows with no clustering annotation — carries
+# its final name. This is the authoritative original -> final liftover.
+trignc_map2 <- if (exists(".trignc_map_acc", envir = .GlobalEnv))
+  get(".trignc_map_acc", envir = .GlobalEnv) else
+  data.table(before = character(0L), after = character(0L), locus = character(0L))
+
+if (isTRUE(opt$trig_nc) && nrow(trignc_map2) > 0L) {
+  tnc2 <- unique(trignc_map2[, .(normalised_name = before, final_name = after, locus)])
+  provenance <- merge(provenance, tnc2, by = c("normalised_name","locus"), all.x = TRUE)
+  # Second-chance join for names carrying an internal _dup<N> tag: strip it and
+  # retry against the TRIG-NC map (which uses clean names).
+  if (any(is.na(provenance$final_name))) {
+    provenance[, .nn_clean := sub("_dup[0-9]+$", "", normalised_name)]
+    tnc3 <- unique(trignc_map2[, .(.nn_clean = before, final2 = after, locus)])
+    provenance <- merge(provenance, tnc3, by = c(".nn_clean","locus"), all.x = TRUE)
+    provenance[is.na(final_name) & !is.na(final2), final_name := final2]
+    provenance[, c(".nn_clean","final2") := NULL]
+  }
+  # IGHD is not TRIG-NC renamed (D genes keep IMGT names); and any remaining
+  # unmatched rows fall back to their clean normalised name.
+  provenance[is.na(final_name), final_name := sub("_dup[0-9]+$", "", normalised_name)]
+} else {
+  # Non-TRIG: final name is new_allele where present, else normalised_name
+  if ("new_allele" %in% names(provenance)) {
+    provenance[, final_name := new_allele]
+    provenance[is.na(final_name) | final_name == "", final_name := normalised_name]
+  } else {
+    provenance[, final_name := normalised_name]
+  }
+}
+
+setcolorder(provenance,
+  intersect(c("raw_header","normalised_name","new_allele","final_name",
+              "locus","source","parse_flag","cluster_id","family_cluster"),
+            names(provenance)))
+
 prov_out <- file.path(opt$outdir, "annotations",
                       paste0(opt$prefix, "_full_provenance.tsv"))
 fwrite(provenance, prov_out, sep = "\t")
-cat(sprintf("  Wrote full provenance    : %s\n", prov_out))
+cat(sprintf("  Wrote full provenance    : %s  (%d rows, %d with final name)\n",
+            prov_out, nrow(provenance),
+            sum(!is.na(provenance$final_name) & provenance$final_name != "")))
 
 # 8d. Pre-flight dropped sequences
 all_dropped <- rbindlist(c(
@@ -2039,7 +2757,10 @@ post_normalise_seqs <- function(seqs, label = "", use_asc = FALSE) {
   }
 
   # ---- Step 3: ensure every name has *NN ----
-  no_star <- !grepl("[*]", new_names)
+  # TRIG-NC colon-format names (IGKJ:01:002:001) already encode the allele as
+  # the final colon field, so they must NOT receive an appended *01.
+  is_trignc <- grepl("^(IG[HKL][VDJ]|TR[ABGD][VDJ]):[0-9]", new_names)
+  no_star <- !grepl("[*]", new_names) & !is_trignc
   if (any(no_star)) {
     message(sprintf("  [POST-NORM] %s: %d names still missing allele number -> *01",
                     label, sum(no_star)))
@@ -2047,9 +2768,12 @@ post_normalise_seqs <- function(seqs, label = "", use_asc = FALSE) {
   }
 
   # ---- Step 4: re-number colliding gene bases sequentially ----
+  # Skip TRIG-NC colon names — their allele numbering is already resolved by
+  # the size-ranked assignment and the colon format has no * to split on.
   gene_allele_count <- list()
   for (i in seq_along(new_names)) {
     nm        <- new_names[i]
+    if (grepl("^(IG[HKL][VDJ]|TR[ABGD][VDJ]):[0-9]", nm)) next
     gene_base <- sub("[*].*$", "", nm)
     cur_n     <- suppressWarnings(as.integer(sub(".*[*]", "", nm)))
     if (is.na(cur_n)) cur_n <- 1L
@@ -2130,26 +2854,118 @@ for (nm in c("IGHJ","IGKJ","IGLJ")) {
   write_fasta(D_gapped, file.path(gapped_dir, paste0(imgt_file_prefix,"_IGHD.fasta")))
 }
 
+# ── Constant region FASTAs (ASC/PIgLET path) ────────────────────────────────
+# Constant genes are not clustered or renamed — they are copied verbatim from
+# the reference (name-deduped), exactly as in --as-is-ids mode. Without this,
+# the ig_c database is built from an empty FASTA in ASC mode.
+cat("\n--- Constant region sequences (from reference, name-deduped) ---\n")
+# Resolve the reference constant directory. opt$ref_dir is the VDJ dir; the
+# constant FASTAs live in a sibling constant/ dir. Try several layouts.
+.const_dirs <- unique(c(
+  sub("/vdj/?$", "/constant", opt$ref_dir),
+  file.path(dirname(opt$ref_dir), "constant"),
+  opt$ref_dir))
+cat(sprintf("  Searching constant dirs: %s\n", paste(.const_dirs, collapse=", ")))
+for (c_locus in c("IGHC","IGKC","IGLC")) {
+  cand <- unlist(lapply(.const_dirs, function(d) c(
+    file.path(d, paste0("imgt_", opt$species, "_", c_locus, ".fasta")),
+    file.path(d, paste0(opt$species, "_", c_locus, ".fasta")),
+    file.path(d, paste0(c_locus, ".fasta")))))
+  c_ref <- Filter(file.exists, cand)[1L]
+  if (is.na(c_ref)) {
+    cat(sprintf("  [SKIP] %s: no reference FASTA found\n", c_locus)); next
+  }
+  ok_write <- tryCatch({
+    c_seqs <- Biostrings::readDNAStringSet(c_ref)
+    if (length(c_seqs) == 0L) { cat(sprintf("  [SKIP] %s: empty file\n", c_locus)); NULL }
+    else {
+      # Parse IMGT pipe headers to field 2 (gene name); fall back to raw name.
+      raw <- names(c_seqs)
+      parsed <- vapply(raw, function(h) {
+        if (grepl("\\|", h)) {
+          f <- strsplit(h, "\\|", fixed = FALSE)[[1]]
+          if (length(f) >= 2L && nzchar(f[2])) f[2] else h
+        } else sub("\\s.*$", "", h)
+      }, character(1L), USE.NAMES = FALSE)
+      names(c_seqs) <- parsed
+      keep <- !duplicated(parsed)
+      n_dup <- sum(!keep)
+      c_seqs <- c_seqs[keep]
+      out_fa <- file.path(gapped_dir, paste0(imgt_file_prefix, "_", c_locus, ".fasta"))
+      write_fasta(c_seqs, out_fa)
+      cat(sprintf("  %s: %d sequences%s -> %s\n", c_locus, length(c_seqs),
+                  if (n_dup > 0L) sprintf(" (%d dup name(s) removed)", n_dup) else "",
+                  basename(out_fa)))
+      TRUE
+    }
+  }, error = function(e) {
+    cat(sprintf("  [ERROR] %s: %s\n", c_locus, conditionMessage(e))); NULL
+  })
+}
+
 # Write the final name map: original raw header -> final sequence name in FASTA.
 # This joins: raw_header -> normalised_name -> post-norm name (after subfamily
 # inference and sequential numbering) -- one row per sequence in the output FASTA.
 if (length(all_post_norm_maps) > 0L) {
   post_norm_dt <- rbindlist(all_post_norm_maps, fill = TRUE)
-  # Join with header_map_dt to get raw_header -> normalised_name -> final_name
-  final_name_map <- merge(
-    header_map_dt[, .(raw_header, normalised_name, parse_flag, locus, source)],
-    post_norm_dt[, .(normalised_name = before, final_fasta_name = after, locus)],
-    by = c("normalised_name", "locus"),
-    all.x = TRUE
-  )
-  # Sequences unchanged by post_normalise_seqs have final_fasta_name == normalised_name
-  final_name_map[is.na(final_fasta_name), final_fasta_name := normalised_name]
+
+  # In TRIG-NC mode the FASTA names were converted from IMGT/OGRDB to colon
+  # format INSIDE annotate_locus (via .trignc_rename_merged), BEFORE
+  # post_normalise_seqs ran. So post_norm_dt$before is already the colon name.
+  # To map the ORIGINAL header through to the colon name we must insert the
+  # TRIG-NC before(IMGT)->after(colon) step between normalised_name and the
+  # post-norm map.
+  trignc_map <- if (exists(".trignc_map_acc", envir = .GlobalEnv))
+    get(".trignc_map_acc", envir = .GlobalEnv) else
+    data.table(before = character(0L), after = character(0L), locus = character(0L))
+
+  if (isTRUE(opt$trig_nc) && nrow(trignc_map) > 0L) {
+    # Chain: raw_header -> normalised_name --(trignc)--> colon --(postnorm)--> final
+    # Step A: normalised_name -> colon name (trignc_map: before=IMGT, after=colon)
+    hdr <- header_map_dt[, .(raw_header, normalised_name, parse_flag, locus, source)]
+    tnc <- unique(trignc_map[, .(normalised_name = before, colon_name = after, locus)])
+    step_a <- merge(hdr, tnc, by = c("normalised_name","locus"), all.x = TRUE)
+    # Where no TRIG-NC entry (shouldn't happen for V/J), colon = normalised
+    step_a[is.na(colon_name), colon_name := normalised_name]
+    # Step B: colon name -> post-norm final (post_norm_dt: before=colon, after=final)
+    pnm <- post_norm_dt[, .(colon_name = before, final_fasta_name = after, locus)]
+    final_name_map <- merge(step_a, pnm, by = c("colon_name","locus"), all.x = TRUE)
+    final_name_map[is.na(final_fasta_name), final_fasta_name := colon_name]
+    # Keep the intermediate colon name visible for provenance
+    setnames(final_name_map, "colon_name", "trignc_name")
+  } else {
+    # Non-TRIG modes: original direct join normalised_name -> final
+    final_name_map <- merge(
+      header_map_dt[, .(raw_header, normalised_name, parse_flag, locus, source)],
+      post_norm_dt[, .(normalised_name = before, final_fasta_name = after, locus)],
+      by = c("normalised_name", "locus"),
+      all.x = TRUE
+    )
+    final_name_map[is.na(final_fasta_name), final_fasta_name := normalised_name]
+  }
+
+  # For ASC / TRIG-NC analysis the map MUST let the user recover the ORIGINAL
+  # input sequence id from the final FASTA name and vice versa. Provide explicit,
+  # clearly-named columns:
+  #   original_id      : the exact id from the user's input / reference FASTA
+  #   normalised_name  : after header parsing (IMGT pipe -> allele, strain tag)
+  #   final_fasta_name : the name written into the output FASTA (TRIG-NC colon
+  #                      format when --trig_nc, else IMGT/ASC name)
+  final_name_map[, original_id := raw_header]
+  setcolorder(final_name_map,
+    intersect(c("original_id","normalised_name","trignc_name","final_fasta_name",
+                "locus","source","parse_flag","raw_header"),
+              names(final_name_map)))
   final_map_out <- file.path(opt$outdir, "annotations",
                               paste0(opt$prefix, "_final_name_map.tsv"))
-  fwrite(final_name_map[order(locus, source, raw_header)],
+  fwrite(final_name_map[order(locus, source, original_id)],
          final_map_out, sep = "\t")
   cat(sprintf("  Wrote final name map     : %s  (%d sequences)\n",
               final_map_out, nrow(final_name_map)))
+  cat(sprintf("    columns: original_id -> normalised_name -> final_fasta_name\n"))
+  n_renamed <- sum(final_name_map$original_id != final_name_map$final_fasta_name, na.rm=TRUE)
+  cat(sprintf("    %d of %d sequences renamed from their original id\n",
+              n_renamed, nrow(final_name_map)))
 }
 
 combined_V <- do.call(c, Filter(Negate(is.null),
@@ -2224,115 +3040,47 @@ for (cand in c(file.path(opt$igdata, "optional_file",
 if (is.null(ref_aux_dt))
   message("  [WARN] No reference aux found; all anchors from motif search")
 
-find_j_anchor <- function(nt_seq, chain_type) {
-  motifs <- list(
-    IGH = c("WGQG","WGPG","WGRG","FGQG","FGAG","FGSG","WGAG","FGTG"),
-    IGK = c("FGQG","FGPG","FGRG","WGQG","FGSG","FGTG","WGPG"),
-    IGL = c("FGGG","FGSG","WGSG","FGAG","FGTG","WGGG")
-  )
-  chain_motifs <- motifs[[chain_type]] %||%
-    unique(unlist(motifs, use.names = FALSE))
-  seq_obj  <- DNAString(nt_seq)
-  best_pos <- NA_integer_
-  for (frame in 0L:2L) {
-    sublen <- nchar(nt_seq) - frame
-    sublen <- sublen - (sublen %% 3L)
-    if (sublen < 3L) next
-    aa <- as.character(translate(subseq(seq_obj, frame+1L, frame+sublen)))
-    for (motif in chain_motifs) {
-      pa <- regexpr(motif, aa, fixed = TRUE)
-      if (pa > 0L) { best_pos <- (pa-1L)*3L+frame; break }
-    }
-    if (!is.na(best_pos)) break
-  }
-  best_pos
-}
-`%||%` <- function(a,b) if (!is.null(a)) a else b
-
-#' Build all candidate names to try when looking up a J-gene anchor.
-#' Handles: species-tag suffixes, allele stripping, legacy short names.
-.aux_candidates <- function(gene_name) {
-  # Build all name variants to try when looking up a J gene in the reference aux.
-  # Reference aux uses both IMGT allele names (IGHJ1*01) and legacy short names (JH1).
-  # Novel alleles may have a species-tag suffix: IGKJ1*02_mouse
-  cands     <- gene_name                            # 1. exact
-  no_tag    <- sub("_[^_*]+$", "", gene_name)       # 2. strip _species
-  if (no_tag != gene_name) cands <- c(cands, no_tag)
-  no_allele <- sub("\\*.*$", "", no_tag)           # 3. strip *allele
-  if (no_allele != no_tag) cands <- c(cands, no_allele)
-  # 4. Legacy short-form: IGHJ1->JH1, IGKJ1->JK1, IGLJ1->JL1
-  short <- no_allele
-  short <- sub("^IGHJ(\\d+)$", "JH\\1", short)
-  short <- sub("^IGKJ(\\d+)$", "JK\\1", short)
-  short <- sub("^IGLJ(\\d+)$", "JL\\1", short)
-  if (short != no_allele) cands <- c(cands, short)
-  unique(cands)
-}
-
-lookup_ref_anchor <- function(gene_name, ref_aux_dt, hmap_dt, annot_dt) {
-  if (is.null(ref_aux_dt)) return(NULL)
-  # Try all candidate names derived from gene_name
-  for (cand in .aux_candidates(gene_name)) {
-    hit <- ref_aux_dt[gene == cand]
-    if (nrow(hit) > 0L) return(hit[1L])
-  }
-  # Via header normalisation map (normalised_name -> raw_header)
-  if (!is.null(hmap_dt) && nrow(hmap_dt) > 0L) {
-    for (rh in hmap_dt[normalised_name == gene_name, raw_header]) {
-      for (cand in .aux_candidates(rh)) {
-        hit <- ref_aux_dt[gene == cand]
-        if (nrow(hit) > 0L) return(hit[1L])
-      }
-    }
-  }
-  # Via PIgLET annotation table (new_allele -> imgt_allele -> legacy name)
-  if (!is.null(annot_dt) && nrow(annot_dt) > 0L) {
-    for (ia in annot_dt[new_allele == gene_name, imgt_allele]) {
-      for (cand in .aux_candidates(ia)) {
-        hit <- ref_aux_dt[gene == cand]
-        if (nrow(hit) > 0L) return(hit[1L])
-      }
-    }
-  }
-  NULL
-}
-
 build_aux_rows <- function(j_seqs_gapped, chain_type,
-                           ref_aux_dt, hmap_dt, annot_dt) {
+                           ref_aux_dt, hmap_dt, annot_dt, ref_seq_map = NULL) {
   if (is.null(j_seqs_gapped) || length(j_seqs_gapped) == 0L)
     return(data.table())
   j_ung <- ungap(j_seqs_gapped)
   rbindlist(lapply(seq_along(j_ung), function(i) {
-    gene   <- names(j_ung)[i]
-    nt     <- as.character(j_ung[[i]])
-    anchor <- NA_integer_; frame <- 0L; method <- "none"
-    rh <- lookup_ref_anchor(gene, ref_aux_dt, hmap_dt, annot_dt)
-    if (!is.null(rh)) {
-      # cdr3_stop in aux is 0-based (per header comment "All positions are 0-based")
-      anchor <- as.integer(rh$cdr3_stop)
-      frame  <- as.integer(rh$frame)
-      method <- "reference_aux"
-    }
-    if (is.na(anchor)) {
-      anchor <- find_j_anchor(nt, chain_type)
-      if (!is.na(anchor)) { frame <- anchor %% 3L; method <- "motif_search" }
-    }
-    if (is.na(anchor)) {
-      message(sprintf("    [WARN] No anchor for %s (%s); defaulting 0", gene, chain_type))
-      anchor <- 0L; method <- "default"
-    }
-    data.table(gene=gene, anchor=anchor, frame=frame,
-               chain=chain_type, anchor_method=method)
+    gene <- names(j_ung)[i]
+    nt   <- as.character(j_ung[[i]])
+    d <- .derive_j_aux(gene, nt, chain_type, ref_aux_dt, hmap_dt, annot_dt,
+                       ref_seq_map = ref_seq_map)
+    data.table(gene=gene, anchor=d$anchor, frame=d$frame, extra_bps=d$extra_bps,
+               chain=chain_type, anchor_method=d$method,
+               motif=if (is.na(d$motif)) NA_character_ else d$motif,
+               motif_anchor=d$motif_anchor, anchor_agrees=d$agrees,
+               seqmatch_stop=d$seqmatch_stop,
+               seqmatch_gene=if (is.na(d$seqmatch_gene)) NA_character_ else d$seqmatch_gene,
+               sequence=nt)
   }))
+}
+
+# Reference-J sequence -> curated anchor map for sequence-identity liftover
+# validation (built from each locus's reference J sequences + the reference aux).
+.asc_ref_jseq_map <- {
+  rj <- Biostrings::DNAStringSet()
+  for (jl in c("IGHJ","IGKJ","IGLJ")) {
+    rg <- J_results[[jl]]$ref_gapped
+    if (!is.null(rg) && length(rg) > 0L) rj <- c(rj, rg)
+  }
+  if (length(rj) > 0L) .build_ref_jseq_anchor_map(rj, ref_aux_dt) else list()
 }
 
 aux_rows <- rbindlist(list(
   build_aux_rows(J_results[["IGHJ"]]$hybrid_gapped, "IGH",
-                 ref_aux_dt, header_map_dt, J_results[["IGHJ"]]$annot),
+                 ref_aux_dt, header_map_dt, J_results[["IGHJ"]]$annot,
+                 ref_seq_map = .asc_ref_jseq_map),
   build_aux_rows(J_results[["IGKJ"]]$hybrid_gapped, "IGK",
-                 ref_aux_dt, header_map_dt, J_results[["IGKJ"]]$annot),
+                 ref_aux_dt, header_map_dt, J_results[["IGKJ"]]$annot,
+                 ref_seq_map = .asc_ref_jseq_map),
   build_aux_rows(J_results[["IGLJ"]]$hybrid_gapped, "IGL",
-                 ref_aux_dt, header_map_dt, J_results[["IGLJ"]]$annot)
+                 ref_aux_dt, header_map_dt, J_results[["IGLJ"]]$annot,
+                 ref_seq_map = .asc_ref_jseq_map)
 ), fill = TRUE)
 
 if (nrow(aux_rows) > 0L) {
@@ -2340,6 +3088,68 @@ if (nrow(aux_rows) > 0L) {
   cat(sprintf("  Anchor summary (%d J genes):\n", nrow(aux_rows)))
   for (i in seq_len(nrow(ms)))
     cat(sprintf("    %-22s : %d\n", ms$anchor_method[i], ms$N[i]))
+
+  # ── J-anchor validation report (sequence-identity ground truth) ─────────
+  # Ground truth = the curated anchor of a reference J sequence IDENTICAL to the
+  # gene's sequence (seqmatch_stop, works for novel names too), else the
+  # name-lifted reference anchor. Compares BOTH our final anchor AND the
+  # sequence-only motif inference against that ground truth.
+  if ("motif_anchor" %in% names(aux_rows)) {
+    gt <- copy(aux_rows)
+    gt[, gt_stop := ifelse(!is.na(seqmatch_stop), seqmatch_stop,
+                    ifelse(grepl("^reference_aux", anchor_method), anchor, NA_integer_))]
+    gt[, gt_src := ifelse(!is.na(seqmatch_stop), "seq_identity",
+                   ifelse(grepl("^reference_aux", anchor_method), "name_lift", NA_character_))]
+    val <- gt[!is.na(gt_stop)]
+    n_chk <- nrow(val)
+    if (n_chk > 0L) {
+      val[, delta_our   := anchor - gt_stop]
+      val[, delta_motif := motif_anchor - gt_stop]
+      n_seq  <- sum(val$gt_src == "seq_identity", na.rm = TRUE)
+      n_ourok <- sum(abs(val$delta_our) <= 1L, na.rm = TRUE)
+      n_ourex <- sum(val$delta_our == 0L, na.rm = TRUE)
+      mv <- val$delta_motif[!is.na(val$delta_motif)]
+      cat(sprintf("  J-anchor validation vs reference (%d genes; %d via exact sequence identity):\n",
+                  n_chk, n_seq))
+      cat(sprintf("    final anchor  : %d/%d within ±1nt, %d exact\n", n_ourok, n_chk, n_ourex))
+      cat(sprintf("    motif-only    : %d/%d within ±1nt, %d exact\n",
+                  sum(abs(mv) <= 1L), length(mv), sum(mv == 0L)))
+      disc <- val[abs(delta_our) > 0L][order(-abs(delta_our))]
+      if (nrow(disc) > 0L) {
+        cat(sprintf("    %d final-anchor discrepancy(ies):\n", nrow(disc)))
+        for (r in seq_len(min(nrow(disc), 20L)))
+          cat(sprintf("      %-24s our=%d vs %s '%s'=%d Δ=%+d motif='%s'\n",
+                      disc$gene[r], disc$anchor[r], disc$gt_src[r],
+                      if (is.na(disc$seqmatch_gene[r])) disc$gene[r] else disc$seqmatch_gene[r],
+                      disc$gt_stop[r], disc$delta_our[r],
+                      if (is.na(disc$motif[r])) "?" else disc$motif[r]))
+      }
+      val_out <- file.path(opt$outdir, "annotations",
+                           paste0(opt$prefix, "_jaux_validation.tsv"))
+      dir.create(dirname(val_out), recursive = TRUE, showWarnings = FALSE)
+      fwrite(val[order(-abs(delta_our)),
+             .(gene, chain, anchor_method, ground_truth = gt_src,
+               gt_gene = seqmatch_gene, reference_stop = gt_stop,
+               our_stop = anchor, motif_stop = motif_anchor,
+               delta_our, delta_motif,
+               agrees_pm1 = abs(delta_our) <= 1L, motif, sequence)],
+             val_out, sep = "\t")
+      cat(sprintf("  Wrote J-anchor validation table: %s (%d rows)\n", val_out, n_chk))
+    }
+
+    # Novel J genes (motif_search) — motif-derived by definition, no reference
+    # to validate against; flag nt-fallback ones as needing manual review.
+    novel <- aux_rows[anchor_method == "motif_search"]
+    n_novel <- nrow(novel)
+    if (n_novel > 0L) {
+      n_fallback <- sum(grepl("nt-fallback", novel$motif), na.rm = TRUE)
+      cat(sprintf("  %d novel J gene(s) used motif-search anchors (no reference to lift)\n",
+                  n_novel))
+      if (n_fallback > 0L)
+        cat(sprintf("    of which %d used the nucleotide-codon fallback (no clean [WF]G.G motif) — review recommended\n",
+                    n_fallback))
+    }
+  }
 }
 aux_path <- file.path(opt$outdir, "auxiliary",
                       paste0(file_prefix,"_gl.aux"))
@@ -2351,17 +3161,8 @@ aux_out <- aux_rows[, .(
   frame     = frame,
   chain_type = chain_type_map[chain],
   cdr3_stop  = anchor,         # 0-based position (matches reference aux format)
-  extra_bps  = 0L             # conservative default; inherited from ref when available
+  extra_bps  = extra_bps       # inherited from the resolved reference row (build_aux_rows)
 )]
-# Where we inherited from reference, use its extra_bps directly
-if (!is.null(ref_aux_dt) && nrow(ref_aux_dt) > 0L) {
-  ref_extras <- ref_aux_dt[, .(gene, extra_bps)]
-  aux_out <- merge(aux_out, ref_extras, by = "gene", all.x = TRUE,
-                   suffixes = c("","_ref"))
-  if ("extra_bps_ref" %in% names(aux_out))
-    aux_out[!is.na(extra_bps_ref), extra_bps := extra_bps_ref]
-  aux_out[, extra_bps_ref := NULL]
-}
 # Write aux file matching the reference format:
 #   1. Two comment lines
 #   2. Legacy short-name rows (JH1, JK1 etc.) — copied from reference aux
@@ -2404,7 +3205,7 @@ if (!is.null(ref_aux_dt) && nrow(ref_aux_dt) > 0L) {
     # e.g. IGHJ1*01_C57BL/6 -> base = IGHJ1*01
     base_nm <- sub("_[^*_][^*]*$", "", nm)  # strip _anything that follows *xx
     # more precisely: strip the last _<tag> that is NOT part of the allele *xx
-    base_nm2 <- sub("(\*\d+)_.*$", "\\1", nm)
+    base_nm2 <- sub("(\\*\\d+)_.*$", "\\1", nm)
     if (base_nm2 != nm && !base_nm2 %in% written_genes) {
       writeLines(paste(base_nm2, fr, ct, stop_, extra_, sep = "\t"), con)
       written_genes <- c(written_genes, base_nm2)

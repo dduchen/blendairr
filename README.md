@@ -70,7 +70,7 @@ Input allele names are preserved directly. This mode runs by default. blendAIRR:
 3. Merges custom and reference sequences under a **priority-aware deduplication** scheme:
    - Custom/OGRDB sequences take precedence over IMGT reference sequences.
    - An IMGT sequence identical to a custom/OGRDB sequence is dropped (the custom allele is retained), *except* for J genes.
-   - **J genes are exempt** from cross-gene dedup, so both OGRDB novel J alleles and standard IMGT J alleles (e.g. `IGKJ1*01`) are retained — this is required for correct J-gene assignment.
+   - **J genes are exempt** from cross-gene dedup, so both OGRDB novel J alleles and standard IMGT J alleles (e.g. `IGKJ1*01`) are retained — this is required for correct J-gene assignment, and both are anchored correctly via the sequence-identity liftover described above.
    - Among IMGT sequences, deduplication is applied only *within* the same gene family, preserving cross-gene identical sequences that are biologically meaningful.
    - **Exact duplicates** — entries with both the same name *and* the same sequence — are always collapsed (across all loci, including J genes), so the reference never contains byte-identical `_1`-suffixed clones.
 4. Disambiguates any remaining identical names by appending `_1`, `_2` etc.
@@ -107,6 +107,49 @@ build_hybrid_igblast_ref \
 ### `--asc`
 
 Uses PIgLET ASC (Allele Sequence Cluster) names (`IGHVFx-Gy*01`) instead of IMGT-style reference-derived names. The same mapping-table caveat as the default mode applies.
+
+### `--asc --trig_nc` — TR/IG Nomenclature Review Committee colon format
+
+`--trig_nc` (implies `--asc`) emits allele names in the colon-delimited format under discussion by the **TR/IG Nomenclature Review Committee (TR-IG NRC)**, an IUIS-affiliated effort to establish a species-agnostic, positionally-neutral identifier scheme to replace the historical IMGT naming for immunoglobulin and T-cell receptor genes.
+
+**Name format:**
+
+```
+LOCUS:family:gene:allele        e.g.  IGHV1-1*01  ->  IGHV:01:001:001
+```
+
+| Field | Width | Meaning |
+|---|---|---|
+| `LOCUS`  | — | Segment token (`IGHV`, `IGKJ`, `TRBV`, …), unchanged |
+| `family` | 2 digits | Gene family / subgroup |
+| `gene`   | 3 digits | Gene (subgroup cluster) within the family |
+| `allele` | 3 digits | Allele within the gene |
+
+Examples: `IGKV4-81*01 -> IGKV:04:081:001`, `IGHV1-20*02_C57BL/6 -> IGHV:01:020:002_C57BL/6` (strain tags preserved).
+
+**How blendAIRR assigns the fields.** The scheme intentionally departs from forcing IMGT subgroup gene numbers, following the NRC direction that 75%-identity subgroup boundaries and legacy IMGT labels (particularly for mouse) are not always appropriate and that a fresh, cluster-based approach is preferable:
+
+1. **Family** is lifted from the closest IMGT family via PIgLET's joint clustering. A novel/OGRDB allele that co-clusters (at the family threshold) with reference alleles inherits that cluster's dominant IMGT family — so `IGHV1`-related sequences stay family 1 (`IGHV:01`). Genuinely novel families, with no reference member in their cluster, are numbered above the highest existing family, size-ranked (most genes first).
+2. **Gene (subgroup cluster)** is assigned *de novo* within each family by PIgLET's allele-cluster threshold, then size-ranked — the cluster with the most alleles becomes gene 1, the next most gene 2, and so on. IMGT subgroup gene numbers are **not** forced through. Reference and novel genes are ranked together so their numbering never collides.
+3. **Allele** is numbered sequentially within each gene.
+
+This mirrors the committee's `LocusSegment_subgroup_cluster_cluster.member#` structure, with clusters numbered by decreasing size within each subgroup.
+
+**Clustering thresholds** are exposed and default to the values discussed by the NRC:
+
+```bash
+build_hybrid_igblast_ref \
+  --species mouse --input_dir ./MRL --outdir ./mrl_asc_ref \
+  --asc --trig_nc \
+  --family-threshold 75 \      # subgroup / family clustering (%)
+  --allele-threshold 95         # allele / cluster-member clustering (%)
+```
+
+**Organism naming.** To avoid mixing colon-format and IMGT-format references in the same IgBLAST `IGDATA`, `--asc`/`--trig_nc` automatically append an `_asc` suffix to the default prefix (organism `hybrid_asc_mouse`). Pass `--prefix` to override.
+
+**Name mapping.** The `annotations/<prefix>_final_name_map.tsv` and `<prefix>_full_provenance.tsv` tables carry the full liftover for every sequence: `original_id → normalised_name → trignc_name → final_fasta_name`, so downstream analysis can round-trip between the original input id, the IMGT name, and the colon identifier.
+
+> **Status:** the TR-IG NRC recommendations are still under active discussion (permanent-ID format, subgroup phylogenetic method, cluster-splitting rules, cross-species registries). blendAIRR's `--trig_nc` implements the colon-format identifier and the size-ranked cluster approach as currently proposed; the exact rules may evolve. See the committee working document for background. This mode is intended for exploratory / parallel-nomenclature use, not as a substitute for an official registry.
 
 ---
 
@@ -149,8 +192,11 @@ Files may also sit directly in `input_dir/` without subdirectories.
 | `--outdir` | ✓ | Output directory — created if absent. |
 | `--piglet` | | Enable PIgLET clustering to assign IMGT-style names to novel alleles. Requires a name mapping table downstream. Off by default. |
 | `--as-is-ids` | | Explicitly request input-names-directly mode. This is the **default**, so the flag is optional (kept for backward compatibility). |
-| `--prefix` | | Prefix for all output filenames (default: `hybrid`). |
+| `--prefix` | | Prefix for all output filenames (default: `hybrid`; auto-becomes `hybrid_asc` under `--asc`/`--trig_nc` unless set). |
 | `--asc` | | Use PIgLET ASC cluster names (`IGHVFx-Gy*01`) instead of IMGT-style names. Implies `--piglet`. |
+| `--trig_nc` | | Emit TR/IG NRC colon-format identifiers (`IGHV:01:001:001`). Implies `--asc`. See the ASC/TRIG-NC section above. |
+| `--family-threshold` | | Family/subgroup clustering identity threshold, percent (default: `75`). |
+| `--allele-threshold` | | Allele/cluster-member clustering identity threshold, percent (default: `95`). |
 | `--skip_blast` | | Skip `makeblastdb` — annotation only. |
 | `--list_species` | | List available IMGT species and exit. |
 
@@ -173,7 +219,7 @@ outdir/
                            (imgt_<org>_ig_v/ig_d/ig_j), and constant (ig_c)
   auxiliary/             ← J-gene aux file + V-gene ndm.imgt annotation
   internal_data/<org>/   ← internal BLAST DBs (V spans all loci) for -organism
-  annotations/           ← cluster tables, header maps, name mapping TSVs *
+  annotations/           ← name maps, provenance, and J-anchor validation TSVs
   logs/                  ← per-step log files
 
   hybrid_run_heavy.sh          ← igblastn + MakeDb.py pipeline for IGH
@@ -183,7 +229,14 @@ outdir/
   hybrid_manifest.tsv          ← inventory of all output files
 ```
 
-\* `annotations/` is only populated in default (PIgLET) and `--asc` modes. In `--as-is-ids` mode no name mapping table is produced because allele names are unchanged.
+Key `annotations/` tables (present in all modes; PIgLET/`--asc` add clustering tables):
+
+| File | Description |
+|---|---|
+| `<prefix>_jaux_validation.tsv` | Per-J-gene aux-coordinate validation (see below) |
+| `<prefix>_final_name_map.tsv` | `original_id → normalised_name → final_fasta_name` for every sequence |
+| `<prefix>_full_provenance.tsv` | Complete per-sequence record with clustering columns |
+| `<prefix>_name_map.tsv` | PIgLET/`--asc` only — source name → assigned name |
 
 ### Name mapping table (PIgLET mode only)
 
@@ -202,6 +255,41 @@ name_map <- fread("annotations/hybrid_name_map.tsv")
 airr_data <- fread("changeo/gather_gex_heavy_db-pass.tsv")
 airr_data[name_map, source_id := i.source_id, on = .(v_call = new_allele)]
 ```
+
+### J-gene auxiliary coordinates and validation
+
+The IgBLAST auxiliary file (`optional_file/<organism>_gl.aux`) tells igblastn where each J gene's CDR3 ends (the conserved Trp/Phe anchor), the coding frame offset, and trailing bases. blendAIRR derives these coordinates identically in every mode using one shared routine, with the following priority:
+
+1. **Exact sequence identity** — if a J sequence is byte-identical to a sequence in the `--species` reference, that reference's **curated** anchor is used verbatim. This is authoritative and correctly handles novel-named alleles (e.g. an OGRDB `IGKJ0-4JXG*00` that is identical to reference `IGKJ1*01`) as well as pseudogenes, where sequence-only inference is unreliable.
+2. **Exact-allele reference match** — by name, when the allele is a known IMGT allele.
+3. **Motif inference** — for genuinely novel sequences with no reference match. The conserved `[WF]-G-X-G` J motif is located (in-frame protein search, with a nucleotide-level fallback), and the anchor/frame are computed from it. Coordinates were calibrated against the IMGT reference so that motif-derived anchors reproduce curated ones exactly for functional J genes.
+4. **Gene-level reference** — a last-resort fallback.
+
+**Validation.** Every build writes `annotations/<prefix>_jaux_validation.tsv`, which compares — for each J gene that has a reference ground truth (by sequence identity or name) — the final anchor and the independent motif inference against the reference's curated anchor:
+
+| Column | Meaning |
+|---|---|
+| `gene`, `chain` | J gene and chain type |
+| `anchor_method` | how the final anchor was chosen (`seq_identity`, `reference_aux(allele)`, `motif_search`, …) |
+| `ground_truth` | `seq_identity` or `name_lift` |
+| `gt_gene` | the reference gene providing ground truth |
+| `reference_stop` | the curated reference CDR3 stop |
+| `our_stop` | the anchor written to the aux |
+| `motif_stop` | what pure motif inference alone would give |
+| `delta_our`, `delta_motif` | difference of each from the reference |
+| `agrees_pm1` | whether the final anchor is within ±1 nt |
+| `motif` | the matched motif (e.g. `WGQG`, `FGSG`, or `F(TTC,nt-fallback)`) |
+| `sequence` | the ungapped J nucleotide sequence, for inspection |
+
+The build log summarises this:
+
+```
+J-anchor validation vs reference (40 genes; 40 via exact sequence identity):
+    final anchor  : 40/40 within ±1nt, 40 exact
+    motif-only    : 38/40 within ±1nt, 38 exact
+```
+
+A gap between the `final anchor` and `motif-only` lines flags sequences where pure motif inference is unreliable (typically pseudogenes or non-canonical J), for which the reference anchor is used instead. The `sequence` column lets you inspect exactly why — e.g. a pseudogene lacking a clean `FGXG` motif. This validation needs no extra inputs: it reuses the `--species` reference already loaded for the build.
 
 ### Generated pipeline scripts
 
@@ -327,6 +415,10 @@ docker pull ghcr.io/dduchen/blendairr:1.2.0
 **Install script skips everything / reports wrong paths.** The generated scripts use paths relative to their own location. If you moved only the script without its sibling `database/`, `auxiliary/`, and `internal_data/` directories, use `--src-dir` to point at the intact output directory. Use `--force` to overwrite files from a previous install.
 
 **Duplicate `_1`-suffixed sequences in the reference.** blendAIRR collapses entries that share both a name and a sequence, so byte-identical clones should not appear. Distinct-name identical-sequence entries are retained intentionally — e.g. an OGRDB novel J allele and a standard IMGT J allele with the same sequence are both kept so downstream tools can report either name. If you deduplicate externally with `seqkit rmdup`, use the `-s` flag to deduplicate by sequence rather than by name.
+
+**A J gene shows a `delta_motif` discrepancy in `<prefix>_jaux_validation.tsv`.** This means the pure motif inference disagreed with the reference's curated anchor for that sequence — but the **final** anchor (`our_stop`) still uses the authoritative reference value when a sequence-identity match exists, so the aux is correct. A `delta_motif` gap almost always indicates a pseudogene or a non-canonical J sequence (check the `motif` column for `nt-fallback` and the `sequence` column for a missing `FGXG`/`WGXG` motif). It is diagnostic, not an error.
+
+**No J-gene calls on light chains (IGK/IGL).** igblastn infers chain type by aligning the query against the `internal_data/<organism>/<organism>_V` database. blendAIRR builds this from an all-loci `ALL_V.fasta`, so kappa/lambda queries are typed as VK/VL rather than defaulting to VH. If you build the internal V database manually, ensure it spans IGHV + IGKV + IGLV. In igblastn calls, light chains additionally need `-num_alignments_D 0` with a valid `-germline_db_D` (the generated `hybrid_run_light.sh` handles this).
 
 ---
 
