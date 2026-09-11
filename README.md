@@ -125,15 +125,19 @@ LOCUS:family:gene:allele        e.g.  IGHV1-1*01  ->  IGHV:01:001:001
 | `gene`   | 3 digits | Gene (subgroup cluster) within the family |
 | `allele` | 3 digits | Allele within the gene |
 
-Examples: `IGKV4-81*01 -> IGKV:04:081:001`, `IGHV1-20*02_C57BL/6 -> IGHV:01:020:002_C57BL/6` (strain tags preserved).
+> **Important:** the gene and allele numbers are **NOT** the IMGT gene/allele numbers — they are reassigned. Only the family is lifted from IMGT. For example, `IGKV4-81*01` keeps family 4 but its gene number `081` is replaced by a size-rank, so it becomes something like `IGKV:04:00N:001` where `N` is its rank among family-4 genes — **not** `IGKV:04:081:001`. The strain tag is preserved as a suffix: `IGHV1-20*02_C57BL/6 -> IGHV:01:00N:00M_C57BL/6`.
 
 **How blendAIRR assigns the fields.** The scheme intentionally departs from forcing IMGT subgroup gene numbers, following the NRC direction that 75%-identity subgroup boundaries and legacy IMGT labels (particularly for mouse) are not always appropriate and that a fresh, cluster-based approach is preferable:
 
 1. **Family** is lifted from the closest IMGT family via PIgLET's joint clustering. A novel/OGRDB allele that co-clusters (at the family threshold) with reference alleles inherits that cluster's dominant IMGT family — so `IGHV1`-related sequences stay family 1 (`IGHV:01`). Genuinely novel families, with no reference member in their cluster, are numbered above the highest existing family, size-ranked (most genes first).
-2. **Gene (subgroup cluster)** is assigned *de novo* within each family by PIgLET's allele-cluster threshold, then size-ranked — the cluster with the most alleles becomes gene 1, the next most gene 2, and so on. IMGT subgroup gene numbers are **not** forced through. Reference and novel genes are ranked together so their numbering never collides.
-3. **Allele** is numbered sequentially within each gene.
+2. **Gene (subgroup cluster)** is defined *entirely* by the ASC allele cluster (PIgLET's 95%-threshold `cluster_id`) — for **all** alleles, IMGT-named or novel alike. Which alleles belong to the same gene is dictated by the clustering, never by the existing IMGT gene name. The gene *number* is then assigned by **size rank** within the family: the cluster with the most alleles becomes gene 1, the next most gene 2, and so on. IMGT gene numbers are never carried through.
+3. **Allele** is numbered sequentially within each gene cluster.
+
+Because the cluster defines the gene, **highly-similar IMGT genes that co-cluster are merged into one gene**. For example, if human `IGHV4-4`, `IGHV4-59`, and `IGHV4-61` co-cluster at the allele threshold, they become a single size-ranked gene (e.g. `IGHV:04:001:001`, `:002`, `:003`, `:004` across their alleles) rather than three separate genes — matching the NRC "the cluster defines the gene / wherever there is doubt we cluster" position. Family is harmonised at the cluster level, so a gene cluster is never split across families even if its members carry IMGT names from different families.
 
 This mirrors the committee's `LocusSegment_subgroup_cluster_cluster.member#` structure, with clusters numbered by decreasing size within each subgroup.
+
+**Mode contrast:** `--as-is-ids` preserves existing IMGT nomenclature verbatim (names unchanged). `--asc`/`--trig_nc` let the ASC clustering dictate the entire family-gene-allele structure; existing IMGT names only optionally inform the *family* number, never the gene numbers.
 
 **Clustering thresholds** are exposed and default to the values discussed by the NRC:
 

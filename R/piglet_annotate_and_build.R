@@ -629,35 +629,58 @@ if (isTRUE(opt$as_is_ids)) {
       out_fa <- file.path(gapped_dir, paste0(imgt_file_prefix, "_", locus, ".fasta"))
       Biostrings::writeXStringSet(seqs, out_fa)
     }
-    # ── Constant region FASTAs: deduplicate by name, write to gapped/ ───────
-    cat("\n--- Constant region sequences (from reference, name-deduped) ---\n")
+    # ── Constant region FASTAs: merge custom + reference, write to gapped/ ──
+    # Custom constant sequences (if provided in the input dir) are merged with
+    # the reference constant genes, custom taking priority on exact-sequence
+    # duplicates — mirroring the V/D/J merge behaviour.
+    cat("\n--- Constant region sequences (custom + reference, name-deduped) ---\n")
     for (locus in const_loci) {
-      # Constant FASTAs live in constant/ not vdj/ — search both the constant
-      # subdirectory and common IGDATA germline locations
+      # Custom constant FASTA lookup (same layout as V/D/J: heavy/ or light/)
+      cchain <- if (startsWith(locus, "IGH")) "heavy" else "light"
+      cust_fa <- Filter(file.exists, c(
+        file.path(opt$custom_dir, "constant", paste0(locus, ".fasta")),
+        file.path(opt$custom_dir, cchain, paste0(locus, ".fasta")),
+        file.path(opt$custom_dir, paste0(locus, ".fasta"))))[1L]
+      # Reference constant FASTA lookup
       ref_const_dir <- sub("/vdj$", "/constant", opt$ref_dir)
       ref_fa <- Filter(file.exists, c(
         file.path(ref_const_dir, paste0("imgt_", opt$species, "_", locus, ".fasta")),
         file.path(ref_const_dir, paste0(opt$species, "_", locus, ".fasta")),
         file.path(ref_const_dir, paste0(locus, ".fasta")),
-        # Also try vdj/ as fallback in case constant/ isn't separate
         file.path(opt$ref_dir, paste0("imgt_", opt$species, "_", locus, ".fasta")),
         file.path(opt$ref_dir, paste0(locus, ".fasta"))))[1L]
-      if (is.na(ref_fa)) {
-        cat(sprintf("  [SKIP] %s: no reference FASTA found\n", locus)); next
+
+      cust_seqs <- if (!is.na(cust_fa))
+        Biostrings::readDNAStringSet(cust_fa) else Biostrings::DNAStringSet()
+      ref_seqs  <- if (!is.na(ref_fa))
+        Biostrings::readDNAStringSet(ref_fa) else Biostrings::DNAStringSet()
+
+      if (length(cust_seqs) == 0L && length(ref_seqs) == 0L) {
+        cat(sprintf("  [SKIP] %s: no custom or reference FASTA found\n", locus)); next
       }
-      seqs <- Biostrings::readDNAStringSet(ref_fa)
-      if (length(seqs) == 0L) {
-        cat(sprintf("  [SKIP] %s: empty FASTA\n", locus)); next
+      # Clean names for both sources
+      clean_nm <- function(s) {
+        if (length(s) == 0L) return(s)
+        nm <- vapply(names(s), .parse_imgt_header, character(1L), USE.NAMES=FALSE)
+        names(s) <- .truncate_id(nm); s
       }
-      # Strip IMGT pipe-delimited headers to plain allele names
-      nms <- vapply(names(seqs), .parse_imgt_header, character(1L),
-                    USE.NAMES=FALSE)
-      nms <- .truncate_id(nms)
-      names(seqs) <- nms
-      # Name-level deduplication only (keep all constant alleles, just remove dups)
+      cust_seqs <- clean_nm(cust_seqs); ref_seqs <- clean_nm(ref_seqs)
+      # Merge custom first (priority), then reference; drop exact-sequence dups
+      # (a reference seq identical to a custom one is dropped) and name dups.
+      seqs <- c(cust_seqs, ref_seqs)
+      n_cust <- length(cust_seqs)
+      if (length(seqs) > 0L) {
+        sc <- as.character(seqs)
+        # drop reference entries whose sequence is identical to a custom one
+        dup_seq <- duplicated(sc)
+        seqs <- seqs[!dup_seq]
+      }
+      nms <- names(seqs)
       n_before <- length(seqs)
       keep <- !duplicated(nms)
       seqs <- seqs[keep]
+      if (!is.na(cust_fa))
+        cat(sprintf("  %s: %d custom + reference merged\n", locus, n_cust))
       n_dup <- n_before - length(seqs)
       cat(sprintf("  %s: %d sequences", locus, length(seqs)))
       if (n_dup > 0L) cat(sprintf(" (%d duplicate names removed)", n_dup))
@@ -1031,7 +1054,7 @@ cat(sprintf("Output     : %s\n\n", opt$outdir))
 # SECTION 1 -- Header normalisation
 # =============================================================================
 # Regex matching the gene-name body of an IMGT allele string.
-.IMGT_RE       <- "(IG[HKL][VDJ]\\d+(?:-\\d+)?(?:-[A-Z0-9]+)?)(\\*\\d+)?"
+.IMGT_RE       <- "(IG[HKL][VDJ](?:\\d+|\\([IVX]+\\))[DP]?(?:/OR[0-9-]+)?(?:-\\d+[DP]?)?(?:-[A-Za-z0-9]+)?)(\\*[A-Za-z0-9]+)?"
 # OGRDB hash IDs: IGxV<digits>[-<digits>]<UPPERCASE+digit hash>*<digits>
 # e.g. IGKV0-2HY3*00  IGKJ0-4JXG*00  (hash is alphanumeric, starts uppercase)
 .OGRDB_HASH_RE <- "^IG[HKL][VDJ]\\d+(-\\d+)?[A-Z][A-Z0-9]*\\*\\d+$"
@@ -1321,25 +1344,21 @@ normalise_name <- function(nm) {
     gene_cl_lookup <- setNames(as.character(ad$cluster_id),     ad$imgt_allele)
   }
 
-  # Gene grouping key:
-  #   - IMGT-named with a dash (IGHV1-11): use the gene base "IGHV1-11"
-  #   - novel/bare: use PIgLET cluster_id (95% allele cluster) when available,
-  #     else fall back to sequence identity.
+  # Gene grouping key — ASC clustering dictates the gene structure for ALL
+  # alleles under --asc/--trig_nc. The PIgLET allele cluster (95% threshold,
+  # cluster_id) defines which alleles belong to the same gene, REGARDLESS of any
+  # existing IMGT gene name. IMGT names only (optionally) inform the FAMILY
+  # number, not the gene grouping. This means highly-similar IMGT genes that
+  # co-cluster (e.g. human IGHV4-4 / IGHV4-59 / IGHV4-61) merge into one
+  # size-ranked cluster-gene, per the NRC "the cluster defines the gene" intent.
+  # Fallback order for the gene key: PIgLET cluster_id -> sequence identity.
   seqs_char <- as.character(DECIPHER::RemoveGaps(merged_seqs, removeGaps = "all"))
-  # Gene grouping keys off the RESOLVED IMGT name. Full IMGT gene names group by
-  # gene base; bare-family / novel names group by PIgLET allele cluster (95%),
-  # falling back to sequence identity.
-  has_dash  <- grepl("^(IG[HKL][VDJ]|TR[ABGD][VDJ])[0-9]+-[0-9]", imgt_names)
   gene_key <- character(n)
   for (i in seq_len(n)) {
-    if (has_dash[i]) {
-      gene_key[i] <- sub("[*].*$", "", imgt_names[i])   # IMGT gene base
-    } else {
-      gc <- gene_cl_lookup[nms[i]]
-      if (is.na(gc)) gc <- gene_cl_lookup[imgt_names[i]]
-      gene_key[i] <- if (!is.na(gc) && nzchar(gc)) paste0("gclust:", gc)
-                     else paste0("seqgene:", seqs_char[i])
-    }
+    gc <- gene_cl_lookup[nms[i]]
+    if (is.na(gc)) gc <- gene_cl_lookup[imgt_names[i]]
+    gene_key[i] <- if (!is.na(gc) && nzchar(gc)) paste0("gclust:", gc)
+                   else paste0("seqgene:", seqs_char[i])
   }
 
   # Assign novel families to rows with no liftable IMGT family (fam_num is NA):
@@ -1365,6 +1384,23 @@ normalise_name <- function(nm) {
                 label, sum(need_fb), length(fb_order),
                 if (length(fb_order)==1L) "y" else "ies",
                 next_fam, next_fam + length(fb_order) - 1L, ref_max_fam))
+  }
+
+  # ── Harmonize family within each ASC gene cluster ───────────────────────
+  # The ASC allele cluster (gene_key) defines the gene, so ALL its members must
+  # share one family. Where per-allele IMGT liftover assigned different families
+  # to members of the same cluster (e.g. a cluster spanning IMGT families),
+  # assign the whole cluster the DOMINANT family among its members. This makes
+  # the ASC clustering the authority on structure while still letting IMGT
+  # names inform the family number.
+  gk_fam <- tapply(seq_len(n), gene_key, function(idx) {
+    fv <- fam_num[idx]; fv <- fv[!is.na(fv)]
+    if (length(fv) == 0L) NA_integer_
+    else as.integer(names(sort(table(fv), decreasing = TRUE))[1L])
+  })
+  for (i in seq_len(n)) {
+    hf <- gk_fam[[gene_key[i]]]
+    if (!is.na(hf)) fam_num[i] <- hf
   }
 
   # ── Within each family: size-rank genes, number alleles ──────────────────
@@ -1399,6 +1435,62 @@ normalise_name <- function(nm) {
                data.table(before = nms,        after = out, locus = label),
                data.table(before = imgt_names,  after = out, locus = label)),
          envir = .GlobalEnv)
+
+  # ── Worked example: how clustering translates to the new nomenclature ────
+  # Surface one illustrative complex family so the log shows, allele-by-allele,
+  # how the ASC clustering restructured existing gene nomenclature. Prefer:
+  #   (a) an ASC gene cluster that MERGED >1 distinct IMGT gene, or
+  #   (b) an IMGT gene whose alleles were SPLIT across >1 ASC gene cluster.
+  # An allele is IMGT-structured if its resolved name has a family AND a gene
+  # segment (dash), e.g. IGHV4-4 — the cases where clustering can split/merge
+  # existing gene nomenclature.
+  imgt_gene_of  <- sub("[*].*$", "", sub("_[^_*]+$", "", imgt_names))  # IMGT gene base
+  is_imgt_named <- grepl("^(IG[HKL][VDJ]|TR[ABGD][VDJ])[0-9]+-", imgt_names)
+  tryCatch({
+    dt_ex <- data.table(
+      orig = imgt_names, imgt_gene = imgt_gene_of, cluster = gene_key,
+      newname = out, is_imgt = is_imgt_named)
+    dt_ex <- dt_ex[is_imgt == TRUE]
+    # Diagnostic: how many IMGT-named alleles, distinct genes, distinct clusters
+    cat(sprintf("  [TRIG-NC] %s: %d IMGT-named allele(s), %d distinct IMGT gene(s), %d distinct ASC cluster(s)\n",
+                label, nrow(dt_ex),
+                if (nrow(dt_ex)) uniqueN(dt_ex$imgt_gene) else 0L,
+                if (nrow(dt_ex)) uniqueN(dt_ex$cluster) else 0L))
+    if (nrow(dt_ex) > 0L) {
+      merged_clusters <- dt_ex[, .(n_genes = uniqueN(imgt_gene),
+                                    genes = paste(sort(unique(imgt_gene)), collapse=",")),
+                               by = cluster][n_genes > 1L][order(-n_genes)]
+      split_genes <- dt_ex[, .(n_clusters = uniqueN(cluster)),
+                           by = imgt_gene][n_clusters > 1L][order(-n_clusters)]
+
+      # Always report the counts so the absence of examples is explicit.
+      cat(sprintf("  [TRIG-NC] %s clustering restructuring: %d merged cluster(s) (multi-gene), %d split gene(s) (multi-cluster)\n",
+                  label, nrow(merged_clusters), nrow(split_genes)))
+
+      show <- NULL; example_kind <- NA_character_
+      if (nrow(split_genes) > 0L) {
+        g <- split_genes$imgt_gene[1L]
+        example_kind <- sprintf("IMGT gene %s split across %d ASC clusters",
+                                g, split_genes$n_clusters[1L])
+        show <- dt_ex[imgt_gene == g][order(cluster, newname)]
+      } else if (nrow(merged_clusters) > 0L) {
+        pc <- merged_clusters$cluster[1L]
+        example_kind <- sprintf("ASC cluster merged %d IMGT genes (%s)",
+                                merged_clusters$n_genes[1L], merged_clusters$genes[1L])
+        show <- dt_ex[cluster == pc][order(newname)]
+      }
+
+      if (!is.null(show) && nrow(show) > 0L) {
+        cat(sprintf("  [TRIG-NC example] %s: %s\n", label, example_kind))
+        for (r in seq_len(min(nrow(show), 12L)))
+          cat(sprintf("      %-22s ->  %s\n", show$orig[r], show$newname[r]))
+        if (nrow(show) > 12L)
+          cat(sprintf("      ... (%d more alleles)\n", nrow(show) - 12L))
+      }
+    }
+  }, error = function(e)
+     cat(sprintf("  [TRIG-NC] %s: example detection skipped (%s)\n",
+                 label, conditionMessage(e))))
 
   names(merged_seqs) <- out
   merged_seqs
@@ -1903,6 +1995,79 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
     }
   }
 
+  # --- 3c. Rescue REFERENCE sequences dropped by PIgLET --------------------
+  # PIgLET can silently drop sequences whose IMGT-gapped structure has an
+  # unexpected/malformed length (e.g. IGHV1-69*03/*07 flagged in pre-flight).
+  # These must NOT be lost — every non-duplicate allele should reach the output.
+  # Rescue path (per user spec): take the dropped sequences, build a DNAStringSet,
+  # remove gaps, AlignSeqs (DECIPHER) together with the RETAINED cluster
+  # representatives, and assign each dropped sequence to the nearest cluster by
+  # ungapped sequence distance — it becomes the next allele in that cluster.
+  missing_ref <- ref_names_clean[!ref_names_clean %in% as.character(tbl$imgt_allele)]
+  # ignore _dup-tagged bare-family artifacts (never real output)
+  missing_ref <- missing_ref[!grepl("_dup", missing_ref, fixed = TRUE)]
+  if (length(missing_ref) > 0L) {
+    cat(sprintf("  [RESCUE] %s: %d reference allele(s) dropped by PIgLET; recovering via DECIPHER AlignSeqs + DistanceMatrix: %s\n",
+                label, length(missing_ref),
+                paste(head(missing_ref, 6L), collapse=", ")))
+
+    # Map ref_gapped names to their cleaned (canonical) names for lookup.
+    ref_gap_names <- names(ref_gapped)
+    ref_gap_clean <- if (exists("ref_name_map")) {
+      vapply(ref_gap_names, function(x) { m <- ref_name_map[x]; if (is.na(m)) x else m },
+             character(1L), USE.NAMES = FALSE)
+    } else ref_gap_names
+
+    # Retained cluster members = reference alleles that ARE in the PIgLET table.
+    retained_names <- as.character(tbl$imgt_allele)
+    ret_idx  <- which(ref_gap_clean %in% retained_names & !duplicated(ref_gap_clean))
+    drop_idx <- vapply(missing_ref, function(mr) {
+      k <- which(ref_gap_clean == mr); if (length(k)) k[1L] else NA_integer_
+    }, integer(1L))
+    valid <- !is.na(drop_idx)
+    if (any(valid) && length(ret_idx) > 0L) {
+      drop_idx <- drop_idx[valid]; missing_ref_ok <- missing_ref[valid]
+      # Build a single DNAStringSet of retained + dropped, ungapped, then align
+      # them together with DECIPHER and compute a distance matrix. Each dropped
+      # sequence is assigned to the cluster of its closest RETAINED allele.
+      pool_idx   <- c(ret_idx, drop_idx)
+      pool_names <- c(ref_gap_clean[ret_idx], missing_ref_ok)
+      pool_seqs  <- DECIPHER::RemoveGaps(ref_gapped[pool_idx], removeGaps = "all")
+      names(pool_seqs) <- make.unique(pool_names)   # guard against name clashes
+      assign_ok <- tryCatch({
+        aln <- DECIPHER::AlignSeqs(pool_seqs, verbose = FALSE, processors = 1L)
+        dm  <- DECIPHER::DistanceMatrix(aln, verbose = FALSE, includeTerminalGaps = FALSE)
+        n_ret <- length(ret_idx)
+        ret_lbl  <- names(pool_seqs)[seq_len(n_ret)]
+        for (j in seq_along(missing_ref_ok)) {
+          mr   <- missing_ref_ok[j]
+          drow <- dm[n_ret + j, seq_len(n_ret)]        # distances to retained only
+          closest_lbl   <- ret_lbl[which.min(drow)]
+          closest_clean <- ref_gap_clean[ret_idx][which.min(drow)]
+          proxy_row <- tbl[tbl$imgt_allele == closest_clean, , drop = FALSE]
+          if (nrow(proxy_row) > 0L) {
+            extra <- copy(as.data.table(proxy_row))
+            extra[, imgt_allele := mr]
+            if ("new_allele" %in% names(extra)) extra[, new_allele := mr]
+            tbl_ref <- rbind(tbl_ref, extra, fill = TRUE)
+            message(sprintf("  [RESCUE] %s: '%s' -> cluster of '%s' (aligned dist=%.4f)",
+                            label, mr, closest_clean, drow[which.min(drow)]))
+          } else {
+            message(sprintf("  [RESCUE] %s: '%s' closest '%s' has no cluster row; unclustered",
+                            label, mr, closest_clean))
+          }
+        }
+        TRUE
+      }, error = function(e) {
+        message(sprintf("  [RESCUE] %s: DECIPHER alignment failed (%s); dropped alleles left unclustered",
+                        label, conditionMessage(e))); FALSE
+      })
+    } else {
+      message(sprintf("  [RESCUE] %s: no retained cluster members to align against; %d allele(s) left unclustered",
+                      label, length(missing_ref)))
+    }
+  }
+
   # --- 4. Build cluster -> best reference representative -------------------
   #   Use the ORIGINAL IMGT allele name (imgt_allele), NOT the PIgLET-renamed
   #   new_allele, as the representative.  This ensures novel allele names are
@@ -2152,7 +2317,14 @@ if (isTRUE(opt$trig_nc)) {
   renamed_custom <- rename_by_table(custom_gapped, annot_df, label = label)
 
   # --- 7. Assemble full annotation table -----------------------------------
-  cols  <- intersect(c("imgt_allele","new_allele","cluster_id","family_cluster"),
+  # piglet_cluster is the PIgLET ASC assignment. For custom rows it was set to
+  # new_allele; give reference rows the same (their new_allele) so the column is
+  # populated consistently for BOTH sources — otherwise reference rows show a
+  # blank piglet_cluster even though they were clustered.
+  if ("new_allele" %in% names(tbl_ref) && !("piglet_cluster" %in% names(tbl_ref)))
+    tbl_ref[, piglet_cluster := new_allele]
+  cols  <- intersect(c("imgt_allele","new_allele","piglet_cluster",
+                        "cluster_id","family_cluster"),
                      names(tbl_ref))
   cols2 <- intersect(c("imgt_allele","new_allele","piglet_cluster",
                         "cluster_id","family_cluster"),
@@ -2169,6 +2341,14 @@ if (isTRUE(opt$trig_nc)) {
   # correct output. Strip rather than error so a clean reference _dup does not
   # abort the whole run.
   full_annot[, new_allele := sub("_dup[0-9]+$", "", new_allele)]
+
+  # Also strip the internal _dup<N> tag from imgt_allele so the annotation
+  # table reflects the ORIGINAL allele name, not the load-time disambiguation
+  # artifact. Duplicate-named input sequences (which parsed to the same IMGT
+  # name) share that name here; they remain distinct rows via their differing
+  # new_allele / cluster assignments.
+  if ("imgt_allele" %in% names(full_annot))
+    full_annot[, imgt_allele := sub("_dup[0-9]+$", "", imgt_allele)]
 
   # Guard only for CUSTOM sequences whose name still contains _dup after
   # stripping the numeric suffix (would indicate a genuine logic error).
@@ -2501,7 +2681,8 @@ header_map_out <- file.path(opt$outdir, "annotations",
 fwrite(header_map_dt, header_map_out, sep = "\t")
 cat(sprintf("  Wrote header map        : %s\n", header_map_out))
 
-# 8b. PIgLET allele cluster annotation: normalised_name -> final cluster name
+# 8b. PIgLET allele cluster annotation: one row per output sequence, with the
+# cluster assignment where PIgLET ran and the sequence itself for QC/provenance.
 all_annot <- list()
 for (nm in c("IGHV","IGKV","IGLV")) {
   a <- V_results[[nm]]$annot
@@ -2511,11 +2692,78 @@ for (nm in c("IGHJ","IGKJ","IGLJ")) {
   a <- J_results[[nm]]$annot
   if (!is.null(a) && nrow(a) > 0L) { a <- copy(a); a$locus <- nm; all_annot[[nm]] <- a }
 }
-combined_annot <- rbindlist(all_annot, fill = TRUE)
+combined_annot <- if (length(all_annot) > 0L) rbindlist(all_annot, fill = TRUE) else
+  data.table(imgt_allele=character(0L))
+
+# Ensure EVERY output sequence appears — including loci/alleles that skipped
+# PIgLET (IGHD is never clustered; V/J loci where all custom seqs were already
+# in the reference). Use the in-memory hybrid_gapped sets (final names already
+# assigned) plus D_gapped, and attach the ungapped sequence for QC/provenance.
+.gapped_all <- list()
+.collect_seqs <- function(s, nm) {
+  if (is.null(s) || length(s) == 0L) return(NULL)
+  data.table(final_name = names(s), locus = nm,
+             sequence = as.character(DECIPHER::RemoveGaps(s, removeGaps = "all")))
+}
+for (nm in c("IGHV","IGKV","IGLV"))
+  .gapped_all[[nm]] <- .collect_seqs(V_results[[nm]]$hybrid_gapped, nm)
+for (nm in c("IGHJ","IGKJ","IGLJ"))
+  .gapped_all[[nm]] <- .collect_seqs(J_results[[nm]]$hybrid_gapped, nm)
+.gapped_all[["IGHD"]] <- .collect_seqs(D_gapped, "IGHD")
+gapped_dt <- if (length(Filter(Negate(is.null), .gapped_all)) > 0L)
+  rbindlist(.gapped_all, fill=TRUE) else
+  data.table(final_name=character(0L), locus=character(0L), sequence=character(0L))
+
+# Add the final (colon/output) name to each annotation row so we can (a) join
+# the sequence and (b) detect which output sequences are missing. In TRIG-NC
+# mode the output name is the colon name from .trignc_map_acc; otherwise it is
+# the annotation's own new_allele/imgt_allele.
+tnc_map <- if (exists(".trignc_map_acc", envir = .GlobalEnv))
+  unique(get(".trignc_map_acc", envir = .GlobalEnv)[, .(before, after, locus)]) else
+  data.table(before=character(0L), after=character(0L), locus=character(0L))
+
+if (nrow(combined_annot) > 0L) {
+  # resolve output name: try new_allele -> colon, then imgt_allele -> colon
+  combined_annot[, .outname := NA_character_]
+  if (nrow(tnc_map) > 0L) {
+    combined_annot[tnc_map, .outname := i.after, on = c(new_allele="before", "locus")]
+    combined_annot[is.na(.outname), .outname := tnc_map[
+      .SD, after, on = c(before="imgt_allele", "locus"), mult="first"]]
+  }
+  # fall back to new_allele (non-TRIG modes) then imgt_allele
+  combined_annot[is.na(.outname) & !is.na(new_allele), .outname := new_allele]
+  combined_annot[is.na(.outname), .outname := imgt_allele]
+
+  # attach sequence by matching the output name to the gapped FASTA name
+  combined_annot[gapped_dt, sequence := i.sequence,
+                 on = c(.outname="final_name", "locus")]
+
+  # rows in the gapped FASTA (all output seqs) not represented in the cluster
+  # table (IGHD, skip-PIgLET loci) — add them with blank cluster columns.
+  seen <- combined_annot[!is.na(.outname), paste(.outname, locus)]
+  extra <- gapped_dt[!paste(final_name, locus) %in% seen]
+  if (nrow(extra) > 0L) {
+    extra_rows <- data.table(
+      imgt_allele = extra$final_name, new_allele = extra$final_name,
+      piglet_cluster = NA_character_, cluster_id = NA_character_,
+      family_cluster = NA_character_, source = "unclustered",
+      locus = extra$locus, sequence = extra$sequence)
+    combined_annot <- rbindlist(list(combined_annot, extra_rows), fill = TRUE)
+  }
+  if (".outname" %in% names(combined_annot)) combined_annot[, .outname := NULL]
+} else {
+  combined_annot <- data.table(
+    imgt_allele = gapped_dt$final_name, new_allele = gapped_dt$final_name,
+    piglet_cluster = NA_character_, cluster_id = NA_character_,
+    family_cluster = NA_character_, source = "unclustered",
+    locus = gapped_dt$locus, sequence = gapped_dt$sequence)
+}
+
 annot_out      <- file.path(opt$outdir, "annotations",
                              paste0(opt$prefix, "_allele_cluster_annotation.tsv"))
 fwrite(combined_annot, annot_out, sep = "\t")
-cat(sprintf("  Wrote cluster annotation: %s\n", annot_out))
+cat(sprintf("  Wrote cluster annotation: %s  (%d rows incl. unclustered)\n",
+            annot_out, nrow(combined_annot)))
 
 # 8c. Nearest-reference distance lookup table
 # For each novel custom allele, records which reference allele was closest
@@ -2858,49 +3106,50 @@ for (nm in c("IGHJ","IGKJ","IGLJ")) {
 # Constant genes are not clustered or renamed — they are copied verbatim from
 # the reference (name-deduped), exactly as in --as-is-ids mode. Without this,
 # the ig_c database is built from an empty FASTA in ASC mode.
-cat("\n--- Constant region sequences (from reference, name-deduped) ---\n")
-# Resolve the reference constant directory. opt$ref_dir is the VDJ dir; the
-# constant FASTAs live in a sibling constant/ dir. Try several layouts.
+cat("\n--- Constant region sequences (custom + reference, name-deduped) ---\n")
+# Constant genes are NOT clustered or renamed (no ASC applies) — custom constant
+# sequences are merged with the reference constant genes, custom taking priority.
 .const_dirs <- unique(c(
   sub("/vdj/?$", "/constant", opt$ref_dir),
   file.path(dirname(opt$ref_dir), "constant"),
   opt$ref_dir))
-cat(sprintf("  Searching constant dirs: %s\n", paste(.const_dirs, collapse=", ")))
+.parse_c_hdr <- function(h) vapply(h, function(x) {
+  if (grepl("\\|", x)) { f <- strsplit(x, "\\|")[[1]]
+    if (length(f) >= 2L && nzchar(f[2])) f[2] else x } else sub("\\s.*$","",x)
+}, character(1L), USE.NAMES = FALSE)
 for (c_locus in c("IGHC","IGKC","IGLC")) {
+  cchain <- if (startsWith(c_locus, "IGH")) "heavy" else "light"
+  cust_fa <- Filter(file.exists, c(
+    file.path(opt$custom_dir, "constant", paste0(c_locus, ".fasta")),
+    file.path(opt$custom_dir, cchain, paste0(c_locus, ".fasta")),
+    file.path(opt$custom_dir, paste0(c_locus, ".fasta"))))[1L]
   cand <- unlist(lapply(.const_dirs, function(d) c(
     file.path(d, paste0("imgt_", opt$species, "_", c_locus, ".fasta")),
     file.path(d, paste0(opt$species, "_", c_locus, ".fasta")),
     file.path(d, paste0(c_locus, ".fasta")))))
   c_ref <- Filter(file.exists, cand)[1L]
-  if (is.na(c_ref)) {
-    cat(sprintf("  [SKIP] %s: no reference FASTA found\n", c_locus)); next
+  if (is.na(cust_fa) && is.na(c_ref)) {
+    cat(sprintf("  [SKIP] %s: no custom or reference FASTA found\n", c_locus)); next
   }
-  ok_write <- tryCatch({
-    c_seqs <- Biostrings::readDNAStringSet(c_ref)
-    if (length(c_seqs) == 0L) { cat(sprintf("  [SKIP] %s: empty file\n", c_locus)); NULL }
-    else {
-      # Parse IMGT pipe headers to field 2 (gene name); fall back to raw name.
-      raw <- names(c_seqs)
-      parsed <- vapply(raw, function(h) {
-        if (grepl("\\|", h)) {
-          f <- strsplit(h, "\\|", fixed = FALSE)[[1]]
-          if (length(f) >= 2L && nzchar(f[2])) f[2] else h
-        } else sub("\\s.*$", "", h)
-      }, character(1L), USE.NAMES = FALSE)
-      names(c_seqs) <- parsed
-      keep <- !duplicated(parsed)
-      n_dup <- sum(!keep)
-      c_seqs <- c_seqs[keep]
-      out_fa <- file.path(gapped_dir, paste0(imgt_file_prefix, "_", c_locus, ".fasta"))
-      write_fasta(c_seqs, out_fa)
-      cat(sprintf("  %s: %d sequences%s -> %s\n", c_locus, length(c_seqs),
-                  if (n_dup > 0L) sprintf(" (%d dup name(s) removed)", n_dup) else "",
-                  basename(out_fa)))
-      TRUE
-    }
-  }, error = function(e) {
-    cat(sprintf("  [ERROR] %s: %s\n", c_locus, conditionMessage(e))); NULL
-  })
+  tryCatch({
+    cust <- if (!is.na(cust_fa)) Biostrings::readDNAStringSet(cust_fa) else Biostrings::DNAStringSet()
+    ref  <- if (!is.na(c_ref))   Biostrings::readDNAStringSet(c_ref)   else Biostrings::DNAStringSet()
+    if (length(cust) > 0L) names(cust) <- .parse_c_hdr(names(cust))
+    if (length(ref)  > 0L) names(ref)  <- .parse_c_hdr(names(ref))
+    n_cust <- length(cust)
+    c_seqs <- c(cust, ref)   # custom first (priority)
+    if (length(c_seqs) == 0L) { cat(sprintf("  [SKIP] %s: empty\n", c_locus)); return(invisible()) }
+    # drop reference entries identical in SEQUENCE to a custom one, then name dups
+    sc <- as.character(c_seqs)
+    c_seqs <- c_seqs[!duplicated(sc)]
+    keep <- !duplicated(names(c_seqs)); n_dup <- sum(!keep)
+    c_seqs <- c_seqs[keep]
+    out_fa <- file.path(gapped_dir, paste0(imgt_file_prefix, "_", c_locus, ".fasta"))
+    write_fasta(c_seqs, out_fa)
+    cat(sprintf("  %s: %d sequences (%d custom%s) -> %s\n", c_locus, length(c_seqs),
+                n_cust, if (n_dup > 0L) sprintf(", %d dup removed", n_dup) else "",
+                basename(out_fa)))
+  }, error = function(e) cat(sprintf("  [ERROR] %s: %s\n", c_locus, conditionMessage(e))))
 }
 
 # Write the final name map: original raw header -> final sequence name in FASTA.
