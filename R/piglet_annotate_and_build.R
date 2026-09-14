@@ -2003,68 +2003,76 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
   # remove gaps, AlignSeqs (DECIPHER) together with the RETAINED cluster
   # representatives, and assign each dropped sequence to the nearest cluster by
   # ungapped sequence distance — it becomes the next allele in that cluster.
+  # Map ref_gapped names to their cleaned (canonical) names for lookup FIRST,
+  # so we can restrict the rescue to sequences that ACTUALLY EXIST in ref_gapped.
+  ref_gap_names <- names(ref_gapped)
+  ref_gap_clean <- if (exists("ref_name_map")) {
+    vapply(ref_gap_names, function(x) { m <- ref_name_map[x]; if (is.na(m)) x else m },
+           character(1L), USE.NAMES = FALSE)
+  } else ref_gap_names
+
+  # A reference allele needs rescue only if it is (a) absent from the PIgLET
+  # table AND (b) still present in ref_gapped as a real sequence. Names that
+  # were removed by LOAD-TIME content-dedup (their ungapped sequence duplicated
+  # another allele) are legitimately gone — they must NOT be resurrected with an
+  # empty sequence. Requiring presence in ref_gap_clean enforces this.
   missing_ref <- ref_names_clean[!ref_names_clean %in% as.character(tbl$imgt_allele)]
-  # ignore _dup-tagged bare-family artifacts (never real output)
   missing_ref <- missing_ref[!grepl("_dup", missing_ref, fixed = TRUE)]
+  missing_ref <- missing_ref[missing_ref %in% ref_gap_clean]   # must exist as a seq
   if (length(missing_ref) > 0L) {
     cat(sprintf("  [RESCUE] %s: %d reference allele(s) dropped by PIgLET; recovering via DECIPHER AlignSeqs + DistanceMatrix: %s\n",
                 label, length(missing_ref),
                 paste(head(missing_ref, 6L), collapse=", ")))
 
-    # Map ref_gapped names to their cleaned (canonical) names for lookup.
-    ref_gap_names <- names(ref_gapped)
-    ref_gap_clean <- if (exists("ref_name_map")) {
-      vapply(ref_gap_names, function(x) { m <- ref_name_map[x]; if (is.na(m)) x else m },
-             character(1L), USE.NAMES = FALSE)
-    } else ref_gap_names
-
     # Retained cluster members = reference alleles that ARE in the PIgLET table.
     retained_names <- as.character(tbl$imgt_allele)
-    ret_idx  <- which(ref_gap_clean %in% retained_names & !duplicated(ref_gap_clean))
-    drop_idx <- vapply(missing_ref, function(mr) {
-      k <- which(ref_gap_clean == mr); if (length(k)) k[1L] else NA_integer_
-    }, integer(1L))
-    valid <- !is.na(drop_idx)
-    if (any(valid) && length(ret_idx) > 0L) {
-      drop_idx <- drop_idx[valid]; missing_ref_ok <- missing_ref[valid]
-      # Build a single DNAStringSet of retained + dropped, ungapped, then align
-      # them together with DECIPHER and compute a distance matrix. Each dropped
-      # sequence is assigned to the cluster of its closest RETAINED allele.
-      pool_idx   <- c(ret_idx, drop_idx)
-      pool_names <- c(ref_gap_clean[ret_idx], missing_ref_ok)
+    # IMGT gene family of a name (the leading IG[HKL][VDJ]<digits>) for scoping.
+    fam_of <- function(v) sub("^(IG[HKL][VDJ][0-9]+).*$", "\\1", v)
+
+    for (mr in missing_ref) {
+      mk <- which(ref_gap_clean == mr)
+      if (length(mk) == 0L) {
+        message(sprintf("  [RESCUE] %s: '%s' not found in ref FASTA; skipped", label, mr)); next
+      }
+      # Candidate retained alleles: prefer the SAME IMGT family (faster and more
+      # meaningful distances); fall back to ALL retained if the family is empty.
+      mr_fam <- fam_of(mr)
+      cand_names <- retained_names[fam_of(retained_names) == mr_fam]
+      if (length(cand_names) == 0L) cand_names <- retained_names
+      cand_idx <- which(ref_gap_clean %in% cand_names & !duplicated(ref_gap_clean))
+      if (length(cand_idx) == 0L) {
+        message(sprintf("  [RESCUE] %s: '%s' no retained candidates; left unclustered", label, mr)); next
+      }
+      # Align the dropped sequence together with the candidate retained set
+      # (DECIPHER AlignSeqs), then DistanceMatrix -> nearest retained allele.
+      pool_idx   <- c(cand_idx, mk[1L])
+      pool_names <- c(ref_gap_clean[cand_idx], mr)
       pool_seqs  <- DECIPHER::RemoveGaps(ref_gapped[pool_idx], removeGaps = "all")
-      names(pool_seqs) <- make.unique(pool_names)   # guard against name clashes
-      assign_ok <- tryCatch({
+      names(pool_seqs) <- make.unique(pool_names)
+      ok <- tryCatch({
         aln <- DECIPHER::AlignSeqs(pool_seqs, verbose = FALSE, processors = 1L)
         dm  <- DECIPHER::DistanceMatrix(aln, verbose = FALSE, includeTerminalGaps = FALSE)
-        n_ret <- length(ret_idx)
-        ret_lbl  <- names(pool_seqs)[seq_len(n_ret)]
-        for (j in seq_along(missing_ref_ok)) {
-          mr   <- missing_ref_ok[j]
-          drow <- dm[n_ret + j, seq_len(n_ret)]        # distances to retained only
-          closest_lbl   <- ret_lbl[which.min(drow)]
-          closest_clean <- ref_gap_clean[ret_idx][which.min(drow)]
-          proxy_row <- tbl[tbl$imgt_allele == closest_clean, , drop = FALSE]
-          if (nrow(proxy_row) > 0L) {
-            extra <- copy(as.data.table(proxy_row))
-            extra[, imgt_allele := mr]
-            if ("new_allele" %in% names(extra)) extra[, new_allele := mr]
-            tbl_ref <- rbind(tbl_ref, extra, fill = TRUE)
-            message(sprintf("  [RESCUE] %s: '%s' -> cluster of '%s' (aligned dist=%.4f)",
-                            label, mr, closest_clean, drow[which.min(drow)]))
-          } else {
-            message(sprintf("  [RESCUE] %s: '%s' closest '%s' has no cluster row; unclustered",
-                            label, mr, closest_clean))
-          }
+        n_c <- length(cand_idx)
+        drow <- dm[n_c + 1L, seq_len(n_c)]              # dropped -> candidates
+        closest_clean <- ref_gap_clean[cand_idx][which.min(drow)]
+        proxy_row <- tbl[tbl$imgt_allele == closest_clean, , drop = FALSE]
+        if (nrow(proxy_row) > 0L) {
+          extra <- copy(as.data.table(proxy_row))
+          extra[, imgt_allele := mr]
+          if ("new_allele" %in% names(extra)) extra[, new_allele := mr]
+          tbl_ref <- rbind(tbl_ref, extra, fill = TRUE)
+          message(sprintf("  [RESCUE] %s: '%s' -> cluster of '%s' (aligned dist=%.4f, %d %s candidates)",
+                          label, mr, closest_clean, drow[which.min(drow)],
+                          n_c, if (length(cand_names) < length(retained_names)) "family" else "all"))
+        } else {
+          message(sprintf("  [RESCUE] %s: '%s' closest '%s' has no cluster row; unclustered",
+                          label, mr, closest_clean))
         }
         TRUE
       }, error = function(e) {
-        message(sprintf("  [RESCUE] %s: DECIPHER alignment failed (%s); dropped alleles left unclustered",
-                        label, conditionMessage(e))); FALSE
+        message(sprintf("  [RESCUE] %s: '%s' DECIPHER align failed (%s); unclustered",
+                        label, mr, conditionMessage(e))); FALSE
       })
-    } else {
-      message(sprintf("  [RESCUE] %s: no retained cluster members to align against; %d allele(s) left unclustered",
-                      label, length(missing_ref)))
     }
   }
 
@@ -2737,6 +2745,69 @@ if (nrow(combined_annot) > 0L) {
   # attach sequence by matching the output name to the gapped FASTA name
   combined_annot[gapped_dt, sequence := i.sequence,
                  on = c(.outname="final_name", "locus")]
+
+  # Fallback for rows whose sequence is still empty: these are alleles that were
+  # removed by LOAD-TIME content dedup (their ungapped sequence is identical to
+  # another retained allele) so they are not in the output FASTA. Recover their
+  # sequence from the per-locus reference/custom gapped sets by imgt_allele name
+  # so the annotation is complete, and flag them as content-duplicates.
+  if (any(is.na(combined_annot$sequence) | combined_annot$sequence == "")) {
+    # Build a name -> ungapped sequence map from the RAW input FASTAs (before any
+    # deduplication), so content-deduplicated but REAL alleles can still recover
+    # their sequence. Only names absent from every raw input are true phantoms.
+    name2seq <- list()
+    .add_raw <- function(path, nm) {
+      if (is.null(path) || !file.exists(path)) return(invisible())
+      s <- tryCatch(readDNAStringSet(path), error = function(e) NULL)
+      if (is.null(s) || length(s) == 0L) return(invisible())
+      ug <- as.character(DECIPHER::RemoveGaps(s, removeGaps = "all"))
+      # parse each header to its allele name (IMGT pipe field or plain)
+      raw_nm <- vapply(names(s), function(h) {
+        if (grepl("\\|", h)) { f <- strsplit(h, "\\|")[[1]]
+          if (length(f) >= 2L && nzchar(f[2])) f[2] else sub("\\s.*$","",h)
+        } else sub("\\s.*$","",h)
+      }, character(1L), USE.NAMES = FALSE)
+      raw_nm <- normalise_name(raw_nm)   # apply same name cleaning as the pipeline
+      for (k in seq_along(ug)) {
+        key <- paste(raw_nm[k], nm)
+        if (is.null(name2seq[[key]])) name2seq[[key]] <- ug[k]
+      }
+    }
+    for (nm in names(loci)) {
+      .add_raw(custom_paths[[nm]], nm)
+      .add_raw(ref_paths[[nm]], nm)
+    }
+    need <- which(is.na(combined_annot$sequence) | combined_annot$sequence == "")
+    for (ri in need) {
+      key <- paste(sub("_dup[0-9]+$", "", combined_annot$imgt_allele[ri]),
+                   combined_annot$locus[ri])
+      s <- name2seq[[key]]
+      if (!is.null(s)) {
+        combined_annot$sequence[ri] <- s
+        # note it as a content-duplicate (not written to the output FASTA)
+        if ("source" %in% names(combined_annot) &&
+            !is.na(combined_annot$source[ri]) &&
+            !grepl("content_dup", combined_annot$source[ri]))
+          combined_annot$source[ri] <- paste0(combined_annot$source[ri], ";content_dup")
+      }
+    }
+    n_recovered <- sum(!(is.na(combined_annot$sequence[need]) | combined_annot$sequence[need]==""))
+    if (n_recovered > 0L)
+      cat(sprintf("  [annot] recovered %d sequence(s) for content-deduplicated alleles\n",
+                  n_recovered))
+    # Drop any rows whose sequence STILL could not be recovered — these do not
+    # correspond to a real input or output sequence (e.g. a spurious allele
+    # number synthesised inside PIgLET's cluster table that maps to no actual
+    # input). Genuine truncated/subsequence alleles were recovered above and are
+    # retained; only true phantoms with no recoverable sequence are removed.
+    still_empty <- which(is.na(combined_annot$sequence) | combined_annot$sequence == "")
+    if (length(still_empty) > 0L) {
+      dropped_names <- combined_annot$imgt_allele[still_empty]
+      cat(sprintf("  [annot] dropping %d annotation row(s) whose name is absent from ALL raw inputs (true phantoms, e.g. PIgLET-synthesised or IMGT-retired numbers): %s\n",
+                  length(still_empty), paste(head(dropped_names, 8L), collapse=", ")))
+      combined_annot <- combined_annot[-still_empty]
+    }
+  }
 
   # rows in the gapped FASTA (all output seqs) not represented in the cluster
   # table (IGHD, skip-PIgLET loci) — add them with blank cluster columns.
