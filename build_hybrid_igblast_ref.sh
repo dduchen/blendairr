@@ -97,6 +97,8 @@ FAM_THRESH=75
 ALLELE_THRESH=95
 V_TRIM3=318
 J_TRIM3=40
+V_TRIM_USER_SET=false
+J_TRIM_USER_SET=false
 LIST_SPECIES=false
 USE_ASC=false
 USE_TRIG_NC=false
@@ -138,8 +140,8 @@ while [[ $# -gt 0 ]]; do
     --skip_constant)        SKIP_CONSTANT=true;  shift ;;
     --family_threshold)     FAM_THRESH="$2";     shift 2 ;;
     --allele_threshold)     ALLELE_THRESH="$2";  shift 2 ;;
-    --v_trim3)              V_TRIM3="$2";        shift 2 ;;
-    --j_trim3)              J_TRIM3="$2";        shift 2 ;;
+    --v_trim3)              V_TRIM3="$2"; V_TRIM_USER_SET=true; shift 2 ;;
+    --j_trim3)              J_TRIM3="$2"; J_TRIM_USER_SET=true; shift 2 ;;
     --list_species)         LIST_SPECIES=true;   shift ;;
     --asc)                  USE_ASC=true; AS_IS_IDS=false; shift ;;  # ASC requires clustering
     --trig_nc|--trig-nc)    USE_TRIG_NC=true; USE_ASC=true; AS_IS_IDS=false; shift ;;  # implies --asc + clustering
@@ -249,8 +251,27 @@ fi
 [[ -d "$INPUT_DIR" ]] || die "Input directory not found: $INPUT_DIR"
 
 # ---------------------------------------------------------------------------
+# Novel-species mode: --species none. No IMGT/IgBLAST reference exists, so skip
+# the reference search entirely and run clustering + TRIG-NC on the custom input
+# alone. Relax the clustering trim unless the user set it, since novel-species
+# V/J may be longer or less well characterised.
+# ---------------------------------------------------------------------------
+NOVEL=false
+if [[ "$(printf '%s' "$SPECIES" | tr '[:upper:]' '[:lower:]')" == "none" ]]; then
+  NOVEL=true
+  REF_VDJ_DIR=""
+  REF_CONST_DIR=""
+  $V_TRIM_USER_SET || V_TRIM3=1000
+  $J_TRIM_USER_SET || J_TRIM3=200
+  header "Novel-species mode (--species none)"
+  info "No reference merge or file copy; clustering + TRIG-NC on custom input only."
+  info "Permissive clustering trim: V<=$V_TRIM3, J<=$J_TRIM3 (override with --v_trim3 / --j_trim3)."
+fi
+
+# ---------------------------------------------------------------------------
 # Locate reference IMGT germline directory for chosen species
 # ---------------------------------------------------------------------------
+if ! $NOVEL; then
 header "Locating reference germlines for species: $SPECIES"
 
 find_ref_vdj_dir() {
@@ -288,6 +309,12 @@ for candidate in \
 done
 [[ -n "$REF_CONST_DIR" ]] && ok "Reference constant dir: $REF_CONST_DIR" \
                            || warn "No constant region directory found for $SPECIES"
+fi   # end: if ! $NOVEL (reference location)
+
+# Reference dir passed to R: empty in novel mode (no reference at all), else the
+# located reference VDJ dir, falling back to the input dir only when a species
+# reference was requested but not found.
+if $NOVEL; then REF_ARG=""; else REF_ARG="${REF_VDJ_DIR:-$INPUT_DIR}"; fi
 
 # ---------------------------------------------------------------------------
 # Locate helper tools
@@ -554,7 +581,7 @@ _run_piglet() {
   fi
   $RSCRIPT "$R_SCRIPT" \
     --custom_dir        "$INPUT_DIR" \
-    --ref_dir           "${REF_VDJ_DIR:-$INPUT_DIR}" \
+    --ref_dir           "$REF_ARG" \
     --species           "$SPECIES" \
     --outdir            "$OUTDIR" \
     --igdata            "$IGDATA" \
@@ -575,7 +602,7 @@ _run_as_is() {
   [[ -f "$R_SCRIPT" ]] || { warn "R script not found: $R_SCRIPT"; return 1; }
   $RSCRIPT "$R_SCRIPT" \
     --custom_dir        "$INPUT_DIR" \
-    --ref_dir           "${REF_VDJ_DIR:-$INPUT_DIR}" \
+    --ref_dir           "$REF_ARG" \
     --species           "$SPECIES" \
     --outdir            "$OUTDIR" \
     --igdata            "$IGDATA" \
