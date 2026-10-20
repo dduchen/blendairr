@@ -244,6 +244,18 @@ build_locus_plot <- function(dt, locus_val, title = NULL) {
   d[, trig_gene := fifelse(is.na(trig_name), NA_character_,
                            sub("^([^:]+):([^:]+):([^:]+):.*$", "\\1:\\2:\\3", trig_name))]
 
+  # In --trig_nc mode the authoritative grouping is the TRIG-NC family and gene,
+  # not PIgLET's internal family_cluster. PIgLET's 75% family threshold can
+  # collapse many closely-related families into a single ASC cluster (e.g. all
+  # human IGHV land in family_cluster 1), which would draw the whole locus as one
+  # family. Repoint the rings to the colon family/gene wherever a TRIG-NC name
+  # exists; the ASC cluster numbers remain the fallback for anything without one.
+  trig_mode <- any(!is.na(d$trig_name))
+  if (trig_mode) {
+    d[!is.na(trig_name), family_cluster := sub("^[^:]+:([^:]+):.*$", "\\1", trig_name)]
+    d[!is.na(trig_name), cluster_id     := trig_gene]
+  }
+
   # Reason for the unclustered ones: cluster_status (strip the prefix) if the
   # builder wrote it, else the IMGT-header reason from the name map, else a
   # generic note.
@@ -382,10 +394,13 @@ build_locus_plot <- function(dt, locus_val, title = NULL) {
   for (i in seq_len(nrow(fam_tab))) {
     b  <- arc_band(fam_tab$a0[i], fam_tab$a1[i], r_fam[1], r_fam[2])
     ft <- fam_trig_lk[fam_tab$family_cluster[i]]
-    htxt <- sprintf("family cluster %s, %d allele(s)%s",
-                    fam_tab$family_cluster[i], fam_tab$n[i],
-                    if (length(ft) && !is.na(ft))
-                      sprintf("<br>TRIG-NC family: %s", ft) else "")
+    htxt <- if (trig_mode && length(ft) && !is.na(ft))
+      sprintf("family %s, %d allele(s)", ft, fam_tab$n[i])
+    else
+      sprintf("family cluster %s, %d allele(s)%s",
+              fam_tab$family_cluster[i], fam_tab$n[i],
+              if (length(ft) && !is.na(ft))
+                sprintf("<br>TRIG-NC family: %s", ft) else "")
     p <- add_polygons(p, x = b$x, y = b$y,
                       line = list(width = 0.5, color = "#FFFFFF"),
                       fillcolor = unname(fam_col[fam_tab$family_cluster[i]]),
@@ -412,10 +427,13 @@ build_locus_plot <- function(dt, locus_val, title = NULL) {
     b   <- arc_band(gsp$a0[i], gsp$a1[i], r_gene[1], r_gene[2])
     key <- paste(gsp$family_cluster[i], gsp$cluster_id[i])
     gt  <- gene_trig_lk[key]
-    htxt <- sprintf("gene cluster %s (family %s)%s",
-                    gsp$cluster_id[i], gsp$family_cluster[i],
-                    if (length(gt) && !is.na(gt))
-                      sprintf("<br>TRIG-NC gene: %s", gt) else "")
+    htxt <- if (trig_mode && length(gt) && !is.na(gt))
+      sprintf("gene %s", gt)
+    else
+      sprintf("gene cluster %s (family %s)%s",
+              gsp$cluster_id[i], gsp$family_cluster[i],
+              if (length(gt) && !is.na(gt))
+                sprintf("<br>TRIG-NC gene: %s", gt) else "")
     p <- add_polygons(p, x = b$x, y = b$y,
                       line = list(width = 0.4, color = "#FFFFFF"),
                       fillcolor = unname(gene_col[key]),

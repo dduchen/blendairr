@@ -1704,17 +1704,28 @@ run_piglet <- function(seqs_gapped, trim3 = 318L, mask5 = 0L,
     else tbl[, new_allele := imgt_allele]  # fall back to identity naming
   }
   # --- ensure cluster_id / family_cluster exist (used by TRIG-NC sizing) ---
+  # This PIgLET version's alleleClusterTable does not expose cluster_id /
+  # family_cluster columns, but the ASC name it assigns (e.g. IGHVF11-G85*01)
+  # encodes both: F<family> and G<gene>. Parse those so the columns match the
+  # ASC F#/G# (all IGHVF11-G.. share family_cluster 11, all *-G85-* share one
+  # gene) rather than a running index for the gene and a constant 1 for family.
   if (!"cluster_id" %in% names(tbl)) {
     cand3 <- c("cluster_id","allele_cluster","cluster","func_group_id")
     hit3  <- cand3[cand3 %in% names(tbl)]
     if (length(hit3) > 0L) setnames(tbl, hit3[1L], "cluster_id")
-    else tbl[, cluster_id := .I]
+    else tbl[, cluster_id := {
+      g <- suppressWarnings(as.integer(fifelse(grepl("G[0-9]+", new_allele),
+             sub("^.*G([0-9]+).*$", "\\1", new_allele), NA_character_)))
+      fifelse(is.na(g), seq_len(.N), g) }]
   }
   if (!"family_cluster" %in% names(tbl)) {
     cand4 <- c("family_cluster","family","fam_cluster","subgroup")
     hit4  <- cand4[cand4 %in% names(tbl)]
     if (length(hit4) > 0L) setnames(tbl, hit4[1L], "family_cluster")
-    else tbl[, family_cluster := 1L]
+    else tbl[, family_cluster := {
+      f <- suppressWarnings(as.integer(fifelse(grepl("F[0-9]+", new_allele),
+             sub("^.*F([0-9]+).*$", "\\1", new_allele), NA_character_)))
+      fifelse(is.na(f), 1L, f) }]
   }
   if (!"removed_duplicated" %in% names(tbl)) {
     cand5 <- c("removed_duplicated","is_duplicate","duplicated")
@@ -1821,7 +1832,38 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
   novel_mask <- !(custom_seqs_chr %in% ref_seqs_chr)
   n_novel <- sum(novel_mask)
 
-  if (n_novel == 0L) {
+  # Disambiguate custom alleles whose NAME matches a reference allele but whose
+  # CONTENT differs (e.g. OGRDB IGHV4-38-2*01 differs by one SNP from IMGT
+  # IGHV4-38-2*01, OGRDB IGLV3-9*01 is a 5' truncation of IMGT IGLV3-9*01).
+  # Left alone, the name-duplicate is dropped before PIgLET (the name-dedup in
+  # step 1) and then proxied onto the reference identity, so the real custom
+  # sequence is mislabelled "not placed" even though the merged FASTA gives it a
+  # distinct allele in the shared gene. Tag the colliding custom entries so
+  # PIgLET sees and clusters each as its own allele. The tag is internal only:
+  # the custom gene base comes from PIgLET's new_allele (not imgt_allele) under
+  # --use_asc, and the tag is stripped from imgt_allele when the annotation is
+  # assembled (step 7), so it never reaches an output FASTA name.
+  keep1 <- !duplicated(ref_names)
+  ref_seq1_by_name <- setNames(ref_seqs_chr[keep1], ref_names[keep1])
+  cust_nm0 <- names(custom_gapped)
+  collide  <- cust_nm0 %in% ref_names &
+              custom_seqs_chr != ref_seq1_by_name[cust_nm0]
+  collide[is.na(collide)] <- FALSE
+  if (any(collide)) {
+    names(custom_gapped)[collide] <- paste0(cust_nm0[collide], "__altseq",
+                                            seq_len(sum(collide)))
+    custom_names <- names(custom_gapped)
+    cat(sprintf("  %s: %d custom allele(s) share a reference name but differ in content; tagged for independent clustering\n",
+                label, sum(collide)))
+  }
+
+  # Only short-circuit when we are NOT building ASC clusters. Under --use_asc
+  # (and therefore --trig_nc) the reference set itself must be clustered by
+  # PIgLET to receive ASC/colon ids, so skipping here would leave every
+  # reference-only allele unclustered even though the custom set added nothing
+  # new (this stranded 15 functional IGKV alleles when all custom seqs were
+  # already in the reference).
+  if (n_novel == 0L && !isTRUE(opt$use_asc)) {
     cat(sprintf("  %s: all %d custom seqs in reference; skipping PIgLET\n", label, length(custom_gapped)))
     # Build a minimal annotation table mapping each custom name to its ref name
     annot_rows <- lapply(seq_along(custom_gapped), function(i) {
@@ -1861,19 +1903,29 @@ annotate_custom_with_ref <- function(custom_gapped, ref_gapped,
   no_star <- !grepl("[*]", ref_nms_clean)
   if (any(no_star))
     ref_nms_clean[no_star] <- paste0(ref_nms_clean[no_star], "*01")
-  # Re-number per gene base to ensure uniqueness
-  gene_seen <- list()
+  # Ensure reference names are unique WITHOUT corrupting real IMGT allele
+  # numbers. Only a TRUE duplicate (the exact same gene*allele seen twice,
+  # e.g. two records both called IGHV1-2*04) is disambiguated, with a _dup
+  # tag that the downstream stripping and anchor-exclusion already understand
+  # and that can never be mistaken for a real allele number.
+  #
+  # The previous block renumbered every 2nd+ allele in a gene sequentially,
+  # so any gap in IMGT numbering corrupted the real numbers: IGHV1-2 carries
+  # *01-*07 and *09 (no *08), so *09 was relabelled *08. PIgLET then clustered
+  # the sequence under that phantom name, the phantom was dropped as "absent
+  # from raw inputs", and the real allele was orphaned into a singleton colon
+  # id ("not ASC-clustered: full length"). Preserving the input numbers keeps
+  # every allele joined to its PIgLET cluster.
+  name_seen <- new.env(parent = emptyenv())
   for (k in seq_along(ref_nms_clean)) {
-    gb  <- sub("[*].*$", "", ref_nms_clean[k])
-    cur <- suppressWarnings(as.integer(sub(".*[*]", "", ref_nms_clean[k])))
-    if (is.na(cur)) cur <- 1L
-    prev <- gene_seen[[gb]]
-    if (is.null(prev)) {
-      gene_seen[[gb]] <- cur
+    nm0  <- ref_nms_clean[k]
+    seen <- name_seen[[nm0]]
+    if (is.null(seen)) {
+      name_seen[[nm0]] <- 1L
     } else {
-      nxt <- as.integer(prev) + 1L
-      ref_nms_clean[k] <- paste0(gb, "*", sprintf("%02d", nxt))
-      gene_seen[[gb]]   <- nxt
+      cnt <- seen + 1L
+      name_seen[[nm0]] <- cnt
+      ref_nms_clean[k] <- paste0(nm0, "_dup", cnt)
     }
   }
   names(ref_for_joint) <- ref_nms_clean
@@ -2401,6 +2453,13 @@ if (isTRUE(opt$trig_nc)) {
   if ("imgt_allele" %in% names(full_annot))
     full_annot[, imgt_allele := sub("_dup[0-9]+$", "", imgt_allele)]
 
+  # Strip the internal __altseq<N> collision tag (added when a custom allele
+  # shares a reference name but differs in content) so the annotation shows the
+  # ORIGINAL custom name. The sequences stay distinct rows via their own
+  # new_allele / cluster assignment — the tag only kept PIgLET from merging them.
+  if ("imgt_allele" %in% names(full_annot))
+    full_annot[, imgt_allele := sub("__altseq[0-9]+$", "", imgt_allele)]
+
   # Guard only for CUSTOM sequences whose name still contains _dup after
   # stripping the numeric suffix (would indicate a genuine logic error).
   cust_bad <- full_annot[source == "custom" & grepl("_dup", new_allele, fixed = TRUE)]
@@ -2925,15 +2984,39 @@ if (nrow(combined_annot) > 0L) {
                               if (locus[i] %in% names(med_lk)) med_lk[[locus[i]]] else NA_real_)
       if (is.na(st)) "full length, not placed in an ASC cluster" else st
     }, character(1))]
-    is_v <- extra$locus %in% c("IGHV", "IGKV", "IGLV")
-    extra[, cstatus := fifelse(locus %in% c("IGHV", "IGKV", "IGLV"),
-                               paste0("not ASC-clustered: ", reason),
-                               "not ASC-clustered (D/J locus, not clustered by PIgLET)")]
+    # A FASTA allele that received a colon id inside a gene that already has
+    # CLUSTERED members IS in that ASC cluster (the gene == the cluster). This
+    # arises for a custom sequence that shares a name with a reference allele
+    # but differs by a 3' truncation: the merged rename gives it a distinct
+    # allele in the shared gene while its proxy row adopted the reference
+    # identity, so the distinct colon id looked unplaced. Mark these clustered
+    # and inherit the gene's cluster ids rather than labelling them "not placed".
+    .colon_gene <- function(x) fifelse(
+      grepl("^[^:]+:[^:]+:[^:]+:", x), sub("^([^:]+:[^:]+:[^:]+):.*$", "\\1", x),
+      NA_character_)
+    cl_gene_dt <- combined_annot[!is.na(.outname) & grepl(":", .outname, fixed = TRUE),
+                                 .(cid = cluster_id[1L], fc = family_cluster[1L]),
+                                 by = .(g = .colon_gene(.outname))]
+    # Coerce to character so the fifelse below (NA_character_ "no" branch) and
+    # the cluster_id/family_cluster columns stay a single type — PIgLET's
+    # cluster_id/family_cluster arrive as integer in some runs, character in
+    # others, and fifelse rejects a mixed yes/no type.
+    cg_cid <- setNames(as.character(cl_gene_dt$cid), cl_gene_dt$g)
+    cg_fc  <- setNames(as.character(cl_gene_dt$fc),  cl_gene_dt$g)
+    extra[, egene := .colon_gene(final_name)]
+    extra[, in_cl_gene := !is.na(egene) & egene %in% names(cg_cid) &
+                          reason == "full length, not placed in an ASC cluster"]
+    extra[, cstatus := fifelse(
+      locus %in% c("IGHV", "IGKV", "IGLV"),
+      fifelse(in_cl_gene, "clustered", paste0("not ASC-clustered: ", reason)),
+      "not ASC-clustered (D/J locus, not clustered by PIgLET)")]
 
     extra_rows <- data.table(
       imgt_allele = extra$orig, new_allele = extra$final_name,
-      piglet_cluster = NA_character_, cluster_id = NA_character_,
-      family_cluster = NA_character_, cluster_status = extra$cstatus,
+      piglet_cluster = NA_character_,
+      cluster_id     = fifelse(extra$in_cl_gene, unname(cg_cid[extra$egene]), NA_character_),
+      family_cluster = fifelse(extra$in_cl_gene, unname(cg_fc[extra$egene]), NA_character_),
+      cluster_status = extra$cstatus,
       source = extra$prov, locus = extra$locus, sequence = extra$sequence)
     combined_annot <- rbindlist(list(combined_annot, extra_rows), fill = TRUE)
   }
@@ -2951,6 +3034,30 @@ if (nrow(combined_annot) > 0L) {
 if (!"cluster_status" %in% names(combined_annot))
   combined_annot[, cluster_status := "clustered"]
 combined_annot[is.na(cluster_status), cluster_status := "clustered"]
+
+# Drop proxy-clone rows: when a custom allele's NAME collided with a reference
+# allele but its own sequence is a distinct variant (e.g. a 3' truncation), the
+# naming step proxied it onto the reference identity, leaving a spurious custom
+# row that carries the REFERENCE sequence alongside the row for the custom's own
+# sequence. Remove the spurious one — a custom row whose sequence is byte-
+# identical to a reference row, where that same custom allele also has a row with
+# a sequence of its own.
+if (all(c("imgt_allele","source","locus","sequence") %in% names(combined_annot))) {
+  combined_annot[, .sk := toupper(gsub("[^ACGTN]", "",
+                     ifelse(is.na(sequence), "", sequence)))]
+  ref_sk <- combined_annot[source == "reference", unique(paste(.sk, locus))]
+  combined_annot[, .nsk := uniqueN(.sk), by = .(imgt_allele, source, locus)]
+  drop_clone <- combined_annot$source == "custom" &
+                paste(combined_annot$.sk, combined_annot$locus) %in% ref_sk &
+                combined_annot$.nsk > 1L
+  if (any(drop_clone)) {
+    cat(sprintf("  [annot] dropping %d proxy-clone row(s) duplicating a reference sequence under a name-colliding custom allele\n",
+                sum(drop_clone)))
+    combined_annot <- combined_annot[!drop_clone]
+  }
+  combined_annot[, c(".sk", ".nsk") := NULL]
+}
+
 setcolorder(combined_annot, intersect(
   c("imgt_allele","new_allele","piglet_cluster","cluster_id","family_cluster",
     "cluster_status","source","locus","sequence"), names(combined_annot)))
