@@ -14,36 +14,49 @@
 
 ## Overview
 
-blendAIRR merges custom germline sequences (e.g. from a non-reference mouse strain such as MRL) with the closest available IMGT reference species (e.g. C57BL/6 mouse) to produce a ready-to-run IgBLAST reference database. Two annotation modes are available:
+blendAIRR merges custom germline sequences (e.g. from OGRDB, or from a non-reference strain such as mouse MRL) with the closest available IMGT reference species to produce a ready-to-run IgBLAST reference database. A ready-to-run human OGRDB example set ships with the repository under `ogrdb_human/`. Three annotation modes are available:
 
-**Default: input names used directly** — Input allele names are used as-is. Custom sequences are merged with reference sequences under a priority-aware deduplication scheme (custom/OGRDB sequences take precedence over IMGT), and IMGT pipe-delimited headers are parsed into clean allele+strain tags (e.g. `IGHV1-11*01_C57BL/6`). No gene-family clustering is performed. This is the simpler, faster, and more transparent approach — allele names in the output directly correspond to names in your input FASTAs and the IMGT reference, so **no name mapping table is needed downstream**. This mode runs by default with the most minimal invocation.
+**Recommended: `--asc --trig_nc` (TR/IG NC colon nomenclature)** — Custom and reference sequences are jointly clustered with [PIgLET](https://bitbucket.org/yaarilab/piglet) and every allele receives a species-agnostic colon identifier (`IGHV:01:001:001`) under the scheme proposed by the TR/IG Nomenclature Review Committee. The gene structure is dictated by the clustering rather than legacy IMGT gene numbers, and an interactive circos plot of the ASC hierarchy is written for each V locus by default. This is the approach we recommend for new work (see the ASC/TRIG-NC section below). It is opt-in — the bare command still runs the as-is mode below.
 
-**`--piglet` (opt-in clustering)** — Novel alleles are jointly clustered with the reference set using [PIgLET](https://bitbucket.org/yaarilab/piglet), which assigns each novel sequence an IMGT-style gene-family name based on co-clustering with known reference alleles. Novel sequences receive new allele designations (e.g. `IGHV1-24*05`). **Downstream analysis must use the allele name mapping table** (`annotations/<prefix>_name_map.tsv`) to reconcile original input names with the renamed alleles. If PIgLET fails to load, blendAIRR automatically falls back to the default as-is mode with a warning.
+**Default: input names used directly** — Input allele names are used as-is. Custom sequences are merged with reference sequences under a priority-aware deduplication scheme (custom/OGRDB sequences take precedence over IMGT), and IMGT pipe-delimited headers are parsed into clean allele+strain tags (e.g. `IGHV1-11*01_C57BL/6`). No gene-family clustering is performed. This is the simpler and most transparent approach — allele names in the output directly correspond to names in your input FASTAs and the IMGT reference, so **no name mapping table is needed downstream**. This mode runs by default with the most minimal invocation.
+
+**`--piglet` (opt-in clustering)** — Novel alleles are jointly clustered with the reference set using PIgLET, which assigns each novel sequence an IMGT-style gene-family name based on co-clustering with known reference alleles. Novel sequences receive new allele designations (e.g. `IGHV1-24*05`). **Downstream analysis must use the allele name mapping table** (`annotations/<prefix>_name_map.tsv`) to reconcile original input names with the renamed alleles. If PIgLET fails to load, blendAIRR automatically falls back to the default as-is mode with a warning.
 
 ---
 
 ## Quick start
 
+The repository ships a ready-to-run human OGRDB example set under `ogrdb_human/` (per-locus FASTAs in `heavy/`, `light/`, and `constant/`), so the commands below run as-is after cloning.
+
 ```bash
 # Pull
 docker pull ghcr.io/dduchen/blendairr:latest
 
-# Run (default mode — input names used directly)
+# Run (recommended — TR/IG NC colon nomenclature on the bundled human OGRDB set)
 docker run --rm \
-  -v "$(pwd)/data":/data \
+  -v "$(pwd)":/data \
   ghcr.io/dduchen/blendairr:latest \
-  --species mouse \
-  --input_dir /data/MRL \
-  --outdir /data/mrl_ref
+  --species human \
+  --input_dir /data/ogrdb_human \
+  --outdir /data/ogrdb_trig \
+  --asc --trig_nc
+
+# Or the simpler default mode (input names used directly, no clustering)
+docker run --rm \
+  -v "$(pwd)":/data \
+  ghcr.io/dduchen/blendairr:latest \
+  --species human \
+  --input_dir /data/ogrdb_human \
+  --outdir /data/ogrdb_ref
 
 # Install into your IgBLAST share directory
-bash data/mrl_ref/hybrid_install_to_igdata.sh $IGDATA --dry-run   # preview
-bash data/mrl_ref/hybrid_install_to_igdata.sh $IGDATA             # install
+bash ogrdb_trig/hybrid_install_to_igdata.sh $IGDATA --dry-run   # preview
+bash ogrdb_trig/hybrid_install_to_igdata.sh $IGDATA             # install
 
 # Annotate sequences (generated scripts are in the output directory)
 export IGDATA=~/share/igblast
-bash data/mrl_ref/hybrid_run_heavy.sh sequences.fasta out_prefix
-bash data/mrl_ref/hybrid_run_light.sh sequences.fasta out_prefix
+bash ogrdb_trig/hybrid_run_heavy.sh sequences.fasta out_prefix
+bash ogrdb_trig/hybrid_run_light.sh sequences.fasta out_prefix
 ```
 
 ### Singularity / HPC
@@ -52,65 +65,19 @@ bash data/mrl_ref/hybrid_run_light.sh sequences.fasta out_prefix
 singularity pull docker://ghcr.io/dduchen/blendairr:latest
 
 singularity run blendAIRR_latest.sif \
-  --species mouse \
-  --input_dir ./MRL \
-  --outdir ./mrl_ref
+  --species human \
+  --input_dir ./ogrdb_human \
+  --outdir ./ogrdb_trig \
+  --asc --trig_nc
 ```
 
 ---
 
 ## Annotation modes
 
-### Default mode — input names used directly (recommended for most users)
+### `--asc --trig_nc` — TR/IG Nomenclature Review Committee colon format (recommended)
 
-Input allele names are preserved directly. This mode runs by default. blendAIRR:
-
-1. Loads your custom FASTAs and the IMGT reference FASTAs for the specified species.
-2. Parses IMGT pipe-delimited headers (e.g. `BK063713|IGHV1-11*01|Mus_musculus_BALB/cJ|F|V-R`) into clean allele+strain tags (e.g. `IGHV1-11*01_BALB/cJ`).
-3. Merges custom and reference sequences under a **priority-aware deduplication** scheme:
-   - Custom/OGRDB sequences take precedence over IMGT reference sequences.
-   - An IMGT sequence identical to a custom/OGRDB sequence is dropped (the custom allele is retained), *except* for J genes.
-   - **J genes are exempt** from cross-gene dedup, so both OGRDB novel J alleles and standard IMGT J alleles (e.g. `IGKJ1*01`) are retained — this is required for correct J-gene assignment, and both are anchored correctly via the sequence-identity liftover described above.
-   - Among IMGT sequences, deduplication is applied only *within* the same gene family, preserving cross-gene identical sequences that are biologically meaningful.
-   - **Exact duplicates** — entries with both the same name *and* the same sequence — are always collapsed (across all loci, including J genes), so the reference never contains byte-identical `_1`-suffixed clones.
-4. Disambiguates any remaining identical names by appending `_1`, `_2` etc.
-5. OGRDB novel allele names (e.g. `IGKV0-4HMC*00`) are **preserved unchanged**.
-
-The allele names in igblastn output, MakeDb.py output, and your analysis are all identical to the names in your input files and the IMGT reference — **no mapping table is needed**.
-
-```bash
-build_hybrid_igblast_ref \
-  --species mouse \
-  --input_dir ./MRL \
-  --outdir ./mrl_ref
-```
-
-### `--piglet` — PIgLET clustering for novel allele discovery
-
-PIgLET jointly clusters your custom sequences with the reference and assigns IMGT-style gene-family names to novel alleles. A sequence with no close reference match may be assigned a name like `IGHV1-24*05` (next available allele number in that gene family).
-
-**Important:** every novel allele receives a new name that differs from its original input identifier. All downstream analysis must join on the name mapping table to recover the original source sequence IDs.
-
-```bash
-# Build with PIgLET clustering (opt-in)
-build_hybrid_igblast_ref \
-  --species mouse \
-  --input_dir ./MRL \
-  --outdir ./mrl_ref \
-  --piglet
-
-# The name mapping table:
-#   annotations/hybrid_name_map.tsv
-#   columns: source_id (original input name) -> new_allele (assigned IMGT name)
-```
-
-### `--asc`
-
-Uses PIgLET ASC (Allele Sequence Cluster) names (`IGHVFx-Gy*01`) instead of IMGT-style reference-derived names. The same mapping-table caveat as the default mode applies.
-
-### `--asc --trig_nc` — TR/IG Nomenclature Review Committee colon format
-
-`--trig_nc` (implies `--asc`) emits allele names in the colon-delimited format under discussion by the **TR/IG Nomenclature Review Committee (TR-IG NRC)**, an IUIS-affiliated effort to establish a species-agnostic, positionally-neutral identifier scheme to replace the historical IMGT naming for immunoglobulin and T-cell receptor genes.
+`--trig_nc` (implies `--asc`) emits allele names in the colon-delimited format under discussion by the **TR/IG Nomenclature Review Committee (TR-IG NRC)**, an IUIS-affiliated effort to establish a species-agnostic, positionally-neutral identifier scheme to replace the historical IMGT naming for immunoglobulin and T-cell receptor genes. This is the recommended mode for new work: the gene structure comes from the clustering rather than legacy IMGT gene numbers, and the build writes an interactive circos plot of the ASC hierarchy for each V locus by default (see below).
 
 **Name format:**
 
@@ -143,23 +110,98 @@ This mirrors the committee's `LocusSegment_subgroup_cluster_cluster.member#` str
 
 ```bash
 build_hybrid_igblast_ref \
-  --species mouse --input_dir ./MRL --outdir ./mrl_asc_ref \
+  --species human --input_dir ./ogrdb_human --outdir ./ogrdb_trig \
   --asc --trig_nc \
   --family-threshold 75 \      # subgroup / family clustering (%)
   --allele-threshold 95         # allele / cluster-member clustering (%)
 ```
 
-**Organism naming.** To avoid mixing colon-format and IMGT-format references in the same IgBLAST `IGDATA`, `--asc`/`--trig_nc` automatically append an `_asc` suffix to the default prefix (organism `hybrid_asc_mouse`). Pass `--prefix` to override.
+**Organism naming.** To avoid mixing colon-format and IMGT-format references in the same IgBLAST `IGDATA`, `--asc`/`--trig_nc` automatically append an `_asc` suffix to the default prefix (organism `hybrid_asc_human`). Pass `--prefix` to override.
 
 **Name mapping.** The `annotations/<prefix>_final_name_map.tsv` and `<prefix>_full_provenance.tsv` tables carry the full liftover for every sequence: `original_id → normalised_name → trignc_name → final_fasta_name`, so downstream analysis can round-trip between the original input id, the IMGT name, and the colon identifier.
 
 > **Status:** the TR-IG NRC recommendations are still under active discussion (permanent-ID format, subgroup phylogenetic method, cluster-splitting rules, cross-species registries). blendAIRR's `--trig_nc` implements the colon-format identifier and the size-ranked cluster approach as currently proposed; the exact rules may evolve. See the committee working document for background. This mode is intended for exploratory / parallel-nomenclature use, not as a substitute for an official registry.
 
+### Interactive ASC circos plot
+
+After an `--asc`/`--trig_nc` build, blendAIRR writes an interactive circos plot for each V locus by default, one self-contained HTML file per locus under `annotations/` (`<prefix>_allele_cluster_annotation_IGHV_circos.html`, and likewise for IGKV and IGLV). The plot renders the ASC hierarchy as concentric rings, family on the outer ring, gene cluster on the middle ring, alleles as leaf ticks, with the clustering dendrogram drawn in the centre. Hovering a leaf shows the original annotation, the ASC name, and the TR/IG NC colon id; hovering a ring shows the cluster and its rolled-up TR/IG NC family or gene. Alleles PIgLET left unclustered (3-prime partial, pseudogene, ORF) appear as hollow markers placed next to their nearest gene, with the reason in the tooltip.
+
+The plots need the R packages `plotly` and `htmlwidgets`; if they are not installed the build finishes normally and the plot step is skipped with a note. Pass `--skip_plot` to turn the step off, or run it later by hand:
+
+```bash
+Rscript R/plot_asc_circos_interactive.R \
+  --annot <outdir>/annotations/<prefix>_allele_cluster_annotation.tsv
+```
+
+### Default mode — input names used directly (simplest; names unchanged)
+
+Input allele names are preserved directly. This mode runs by default. blendAIRR:
+
+1. Loads your custom FASTAs and the IMGT reference FASTAs for the specified species.
+2. Parses IMGT pipe-delimited headers (e.g. `BK063713|IGHV1-11*01|Mus_musculus_BALB/cJ|F|V-R`) into clean allele+strain tags (e.g. `IGHV1-11*01_BALB/cJ`).
+3. Merges custom and reference sequences under a **priority-aware deduplication** scheme:
+   - Custom/OGRDB sequences take precedence over IMGT reference sequences.
+   - An IMGT sequence identical to a custom/OGRDB sequence is dropped (the custom allele is retained), *except* for J genes.
+   - **J genes are exempt** from cross-gene dedup, so both OGRDB novel J alleles and standard IMGT J alleles (e.g. `IGKJ1*01`) are retained — this is required for correct J-gene assignment, and both are anchored correctly via the sequence-identity liftover described above.
+   - Among IMGT sequences, deduplication is applied only *within* the same gene family, preserving cross-gene identical sequences that are biologically meaningful.
+   - **Exact duplicates** — entries with both the same name *and* the same sequence — are always collapsed (across all loci, including J genes), so the reference never contains byte-identical `_1`-suffixed clones.
+4. Disambiguates any remaining identical names by appending `_1`, `_2` etc.
+5. OGRDB novel allele names (e.g. `IGKV0-4HMC*00`) are **preserved unchanged**.
+
+The allele names in igblastn output, MakeDb.py output, and your analysis are all identical to the names in your input files and the IMGT reference — **no mapping table is needed**.
+
+```bash
+build_hybrid_igblast_ref \
+  --species human \
+  --input_dir ./ogrdb_human \
+  --outdir ./ogrdb_ref
+```
+
+### `--piglet` — PIgLET clustering for novel allele discovery
+
+PIgLET jointly clusters your custom sequences with the reference and assigns IMGT-style gene-family names to novel alleles. A sequence with no close reference match may be assigned a name like `IGHV1-24*05` (next available allele number in that gene family).
+
+**Important:** every novel allele receives a new name that differs from its original input identifier. All downstream analysis must join on the name mapping table to recover the original source sequence IDs.
+
+```bash
+# Build with PIgLET clustering (opt-in)
+build_hybrid_igblast_ref \
+  --species human \
+  --input_dir ./ogrdb_human \
+  --outdir ./ogrdb_ref \
+  --piglet
+
+# The name mapping table:
+#   annotations/hybrid_name_map.tsv
+#   columns: source_id (original input name) -> new_allele (assigned IMGT name)
+```
+
+### `--asc`
+
+Uses PIgLET ASC (Allele Sequence Cluster) names (`IGHVFx-Gy*01`) instead of IMGT-style reference-derived names. The same mapping-table caveat as the default mode applies.
+
+### `--species none` — novel species with no reference
+
+For a species that has no IMGT or IgBLAST reference at all, pass `--species none`. blendAIRR then runs ASC clustering and TRIG-NC colon-id assignment on your input sequences alone, with no reference merge and nothing to copy over.
+
+```bash
+bash build_hybrid_igblast_ref.sh \
+  --species none --input_dir ./novel_sp --outdir ./novel_asc_ref \
+  --asc --trig_nc
+```
+
+Behaviour in this mode:
+
+- **Original ids are kept.** Input ids that are not IMGT or OGRDB format are retained as-is, with characters that are illegal in a FASTA id or `makeblastdb` (commas, forward and back slashes, pipes, whitespace, quotes, brackets) sanitized to underscores. These sanitized ids are the `original_id` in the name map, and the ASC cluster name and colon id are assigned from the clustering.
+- **Family and gene numbers are size-ranked from the clustering alone** (reference max family is zero), so alleles still receive colon ids such as `IGHV:01:001:001`. The locus prefix comes from the input locus (the subfolder the FASTA was provided under), so ids need not start with an `IG`/`TR` token.
+- **Permissive clustering length.** V and J clustering uses a relaxed 3-prime trim (V up to 1000, J up to 200 gapped positions) since novel-species segments may be longer or less well characterised. Override with `--v_trim3 N` / `--j_trim3 N`.
+- **`--ref_dir` and `--igdata` are optional.** No existing germline, domain-model or aux files are copied. If IgBLAST tools are available the output BLAST databases are still built with `makeblastdb`, and the aux file is inferred from the sequences (motif-based), so the result is a standalone, ready-to-run reference.
+
 ---
 
 ## Input requirements
 
-blendAIRR expects IMGT-gapped germline FASTA files (dots for gap positions, 312 nt V region) organised as follows. Missing loci are filled automatically from the reference species.
+blendAIRR expects IMGT-gapped germline FASTA files (dots for gap positions, 312 nt V region) organised as follows. Missing loci are filled automatically from the reference species. The bundled `ogrdb_human/` set follows this layout and is a ready-made example.
 
 ```
 input_dir/
@@ -172,9 +214,11 @@ input_dir/
     IGKJ.fasta   ← optional
     IGLV.fasta   ← optional
     IGLJ.fasta   ← optional
+  constant/
+    IGHC.fasta   ← optional; custom constant segments (IGHC/IGKC/IGLC)
 ```
 
-Files may also sit directly in `input_dir/` without subdirectories.
+Files may also sit directly in `input_dir/` without subdirectories. The bundled `ogrdb_human/` additionally ships combined per-locus files (`IGHVDJ.fasta`, `IGKVJ.fasta`, `IGLVJ.fasta`) for convenience with other tools; blendAIRR itself reads the per-segment FASTAs under `heavy/`, `light/`, and `constant/`.
 
 **FASTA header formats accepted in `--as-is-ids` mode:**
 
@@ -194,13 +238,14 @@ Files may also sit directly in `input_dir/` without subdirectories.
 | `--species` | ✓ | Closest IMGT reference species (e.g. `mouse`, `human`). Run `--list_species` to see what is available. |
 | `--input_dir` | ✓ | Directory containing your custom germline FASTAs (see layout above). |
 | `--outdir` | ✓ | Output directory — created if absent. |
+| `--asc` | | Use PIgLET ASC cluster names (`IGHVFx-Gy*01`) instead of IMGT-style names. Implies `--piglet`. |
+| `--trig_nc` | | **Recommended.** Emit TR/IG NRC colon-format identifiers (`IGHV:01:001:001`). Implies `--asc`. See the ASC/TRIG-NC section above. |
 | `--piglet` | | Enable PIgLET clustering to assign IMGT-style names to novel alleles. Requires a name mapping table downstream. Off by default. |
 | `--as-is-ids` | | Explicitly request input-names-directly mode. This is the **default**, so the flag is optional (kept for backward compatibility). |
 | `--prefix` | | Prefix for all output filenames (default: `hybrid`; auto-becomes `hybrid_asc` under `--asc`/`--trig_nc` unless set). |
-| `--asc` | | Use PIgLET ASC cluster names (`IGHVFx-Gy*01`) instead of IMGT-style names. Implies `--piglet`. |
-| `--trig_nc` | | Emit TR/IG NRC colon-format identifiers (`IGHV:01:001:001`). Implies `--asc`. See the ASC/TRIG-NC section above. |
 | `--family-threshold` | | Family/subgroup clustering identity threshold, percent (default: `75`). |
 | `--allele-threshold` | | Allele/cluster-member clustering identity threshold, percent (default: `95`). |
+| `--skip_plot` | | Skip the interactive ASC circos plots (`--asc`/`--trig_nc` only; plots run by default otherwise). |
 | `--skip_blast` | | Skip `makeblastdb` — annotation only. |
 | `--list_species` | | List available IMGT species and exit. |
 
@@ -223,7 +268,8 @@ outdir/
                            (imgt_<org>_ig_v/ig_d/ig_j), and constant (ig_c)
   auxiliary/             ← J-gene aux file + V-gene ndm.imgt annotation
   internal_data/<org>/   ← internal BLAST DBs (V spans all loci) for -organism
-  annotations/           ← name maps, provenance, and J-anchor validation TSVs
+  annotations/           ← name maps, provenance, J-anchor validation, and
+                           (under --asc/--trig_nc) the interactive circos HTML
   logs/                  ← per-step log files
 
   hybrid_run_heavy.sh          ← igblastn + MakeDb.py pipeline for IGH
@@ -240,6 +286,8 @@ Key `annotations/` tables (present in all modes; PIgLET/`--asc` add clustering t
 | `<prefix>_jaux_validation.tsv` | Per-J-gene aux-coordinate validation (see below) |
 | `<prefix>_final_name_map.tsv` | `original_id → normalised_name → final_fasta_name` for every sequence |
 | `<prefix>_full_provenance.tsv` | Complete per-sequence record with clustering columns |
+| `<prefix>_allele_cluster_annotation.tsv` | PIgLET/`--asc` only — per-allele cluster assignment and status |
+| `<prefix>_allele_cluster_annotation_<locus>_circos.html` | `--asc`/`--trig_nc` only — interactive circos plot per V locus |
 | `<prefix>_name_map.tsv` | PIgLET/`--asc` only — source name → assigned name |
 
 ### Name mapping table (PIgLET mode only)
@@ -334,21 +382,21 @@ bash outdir/hybrid_install_to_igdata.sh $IGDATA --force
 bash outdir/hybrid_install_to_igdata.sh $IGDATA --dry-run --force
 
 # Point at a different source directory (e.g. host path after a Docker build)
-bash outdir/hybrid_install_to_igdata.sh $IGDATA --src-dir ./data/mrl_ref
+bash outdir/hybrid_install_to_igdata.sh $IGDATA --src-dir ./ogrdb_trig
 ```
 
 Flags may appear in any order, before or after the IGDATA path. `--force` overwrites existing files (shown as `[OVERWRITTEN]`) and forces a rebuild of the combined `ig_*` BLAST databases from the freshly copied FASTAs.
 
-After installation, run igblastn. **Heavy chain (IGH):**
+After installation, run igblastn. The `-organism` and database names follow the build's prefix — `hybrid_<species>` in default mode, `hybrid_asc_<species>` under `--asc`/`--trig_nc` (e.g. `hybrid_asc_human`). **Heavy chain (IGH):**
 
 ```bash
 export IGDATA=~/share/igblast
 igblastn \
-  -organism       hybrid_mouse \
-  -germline_db_V  $IGDATA/database/imgt_hybrid_mouse_IGHV \
-  -germline_db_D  $IGDATA/database/imgt_hybrid_mouse_IGHD \
-  -germline_db_J  $IGDATA/database/imgt_hybrid_mouse_IGHJ \
-  -auxiliary_data $IGDATA/optional_file/hybrid_mouse_gl.aux \
+  -organism       hybrid_asc_human \
+  -germline_db_V  $IGDATA/database/imgt_hybrid_asc_human_IGHV \
+  -germline_db_D  $IGDATA/database/imgt_hybrid_asc_human_IGHD \
+  -germline_db_J  $IGDATA/database/imgt_hybrid_asc_human_IGHJ \
+  -auxiliary_data $IGDATA/optional_file/hybrid_asc_human_gl.aux \
   -domain_system  imgt -ig_seqtype Ig \
   -outfmt 19 -query sequences.fasta -out output.airr.tsv
 ```
@@ -357,12 +405,12 @@ igblastn \
 
 ```bash
 igblastn \
-  -organism       hybrid_mouse \
-  -germline_db_V  $IGDATA/database/imgt_hybrid_mouse_IGKV \
-  -germline_db_J  $IGDATA/database/imgt_hybrid_mouse_IGKJ \
-  -germline_db_D  $IGDATA/database/imgt_hybrid_mouse_ig_d \
+  -organism       hybrid_asc_human \
+  -germline_db_V  $IGDATA/database/imgt_hybrid_asc_human_IGKV \
+  -germline_db_J  $IGDATA/database/imgt_hybrid_asc_human_IGKJ \
+  -germline_db_D  $IGDATA/database/imgt_hybrid_asc_human_ig_d \
   -num_alignments_D 0 \
-  -auxiliary_data $IGDATA/optional_file/hybrid_mouse_gl.aux \
+  -auxiliary_data $IGDATA/optional_file/hybrid_asc_human_gl.aux \
   -domain_system  imgt -ig_seqtype Ig \
   -outfmt 19 -query light_sequences.fasta -out output.airr.tsv
 ```
@@ -387,8 +435,8 @@ make build
 # Smoke test
 make test
 
-# Run with local image
-make run ARGS="--species mouse --input_dir /data/MRL --outdir /data/out --as-is-ids"
+# Run with local image (recommended TR/IG NC mode on the bundled human OGRDB set)
+make run ARGS="--species human --input_dir /data/ogrdb_human --outdir /data/out --asc --trig_nc"
 ```
 
 ---

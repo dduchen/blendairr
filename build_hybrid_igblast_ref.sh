@@ -57,6 +57,7 @@
 #   -e, --edit_imgt PATH    Path to edit_imgt_file.pl (default: auto-detect).
 #   --skip_blast            Annotation only; skip makeblastdb.
 #   --skip_constant         Skip constant region database build.
+#   --skip_plot             Skip the interactive ASC circos plots (--asc/--trig_nc only).
 #   --family_threshold N    PIgLET family clustering threshold (default: 75).
 #   --allele_threshold N    PIgLET allele cluster threshold (default: 95).
 #   --v_trim3 N             3-prime V trim for clustering (default: 318).
@@ -70,7 +71,9 @@
 #   database/                    IgBLAST BLAST databases (per-locus + combined)
 #   auxiliary/                   J-gene aux file + V-gene ndm.imgt
 #   internal_data/<organism>/    Internal BLAST DBs for igblastn -organism
-#   annotations/                 Cluster tables, name maps, provenance TSVs
+#   annotations/                 Cluster tables, name maps, provenance TSVs,
+#                                and (with --asc/--trig_nc) interactive circos
+#                                HTML plots of the ASC clustering per V locus
 #   logs/                        Per-step logs
 #   <prefix>_run_heavy.sh        igblastn + MakeDb.py pipeline — IGH
 #   <prefix>_run_light.sh        igblastn + MakeDb.py pipeline — IGK + IGL
@@ -93,6 +96,7 @@ RSCRIPT=""
 EDIT_IMGT=""
 SKIP_BLAST=false
 SKIP_CONSTANT=false
+SKIP_PLOT=false
 FAM_THRESH=75
 ALLELE_THRESH=95
 V_TRIM3=318
@@ -138,6 +142,7 @@ while [[ $# -gt 0 ]]; do
     -e|--edit_imgt)         EDIT_IMGT="$2";      shift 2 ;;
     --skip_blast)           SKIP_BLAST=true;     shift ;;
     --skip_constant)        SKIP_CONSTANT=true;  shift ;;
+    --skip_plot)            SKIP_PLOT=true;      shift ;;
     --family_threshold)     FAM_THRESH="$2";     shift 2 ;;
     --allele_threshold)     ALLELE_THRESH="$2";  shift 2 ;;
     --v_trim3)              V_TRIM3="$2"; V_TRIM_USER_SET=true; shift 2 ;;
@@ -1865,6 +1870,36 @@ chmod +x "$INSTALL_CMD"
 ok "  $(basename "$INSTALL_CMD")"
 
 # ---------------------------------------------------------------------------
+# Interactive ASC circos plots (one HTML per V locus). Runs by default after an
+# --asc/--trig_nc build, since those produce the ASC cluster structure the plot
+# needs; skipped for as-is runs or with --skip_plot.
+# ---------------------------------------------------------------------------
+PLOT_SCRIPT="${HYBRID_IGBLAST_PLOT_SCRIPT:-$SCRIPT_DIR/R/plot_asc_circos_interactive.R}"
+ANNOT_TSV="$OUTDIR/annotations/${PREFIX}_allele_cluster_annotation.tsv"
+if $SKIP_PLOT; then
+  info "Circos plot skipped (--skip_plot)."
+elif ! $USE_ASC; then
+  info "Circos plot skipped (needs --asc/--trig_nc clustering)."
+elif [[ ! -f "$PLOT_SCRIPT" ]]; then
+  warn "Circos plot script not found: $PLOT_SCRIPT"
+elif [[ ! -f "$ANNOT_TSV" ]]; then
+  warn "Circos plot skipped: annotation table not found: $ANNOT_TSV"
+else
+  header "Step 7: Interactive ASC circos plots"
+  # Needs the plotly / htmlwidgets R packages; non-fatal if missing.
+  if $RSCRIPT -e 'q(status = as.integer(!all(c("plotly","htmlwidgets","data.table") %in% rownames(installed.packages()))))' 2>/dev/null; then
+    if $RSCRIPT "$PLOT_SCRIPT" --annot "$ANNOT_TSV" 2>&1 | tee "$OUTDIR/logs/circos_plot.log"; then
+      ok "Circos plots written to $OUTDIR/annotations/ (one *_circos.html per V locus)"
+    else
+      warn "Circos plot step failed (see $OUTDIR/logs/circos_plot.log). Build is otherwise complete."
+    fi
+  else
+    warn "Circos plot skipped: R packages plotly / htmlwidgets not installed."
+    warn "  Install with: Rscript -e \"install.packages(c('plotly','htmlwidgets'))\""
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 header "Build complete"
@@ -1880,6 +1915,9 @@ echo "    BLAST databases         : $OUTDIR/database/"
 echo "    Aux file                : ${_ABS_OUTDIR}/auxiliary/${ORGANISM}_gl.aux"
 echo "    ndm.imgt                : ${_ABS_OUTDIR}/auxiliary/${ORGANISM}.ndm.imgt"
 echo "    Annotation tables       : $OUTDIR/annotations/"
+if $USE_ASC && ! $SKIP_PLOT; then
+echo "    ASC circos plots        : $OUTDIR/annotations/${PREFIX}_allele_cluster_annotation_*_circos.html"
+fi
 echo "    Heavy chain pipeline    : $HEAVY_CMD"
 echo "    Light chain pipeline    : $LIGHT_CMD"
 echo "    Install to IGDATA       : $INSTALL_CMD"
