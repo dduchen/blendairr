@@ -133,9 +133,18 @@ cat(sprintf("ASC thresholds: family=%.0f%%  allele=%.0f%%\n",
 # file_prefix: used for ALL output file names (FASTAs, databases, aux, ndm.imgt).
 # Defaults to <prefix>_<species> (e.g. "hybrid_mouse") for consistency with the
 # bash script's ORGANISM variable. Can be overridden with --organism.
-file_prefix <- ifelse(!is.null(opt$organism) && nchar(trimws(opt$organism)) > 0,
-                      opt$organism,
-                      paste0(opt$prefix, "_", opt$species))
+file_prefix <- if (!is.null(opt$organism) && nchar(trimws(opt$organism)) > 0) {
+  opt$organism
+} else if (NO_REF) {
+  # Novel build: no species to merge with, so do not append '_none'. Use the
+  # prefix alone, defaulting to 'blendairr' when the prefix is the stock 'hybrid'
+  # (mirrors the bash script, which names a novel build 'blendairr' unless the
+  # user set --prefix). The bash wrapper normally passes --organism, so this only
+  # governs a direct Rscript invocation.
+  if (identical(opt$prefix, "hybrid")) "blendairr" else opt$prefix
+} else {
+  paste0(opt$prefix, "_", opt$species)
+}
 # imgt_file_prefix: used for gapped FASTA filenames to match Immcantation convention
 # e.g. imgt_hybrid_mouse_IGHV.fasta  (mirrors imgt_mouse_IGHV.fasta in reference)
 imgt_file_prefix <- paste0("imgt_", file_prefix)
@@ -528,11 +537,14 @@ if (isTRUE(opt$as_is_ids)) {
           gene_allele <- if (length(parts) >= 2L) parts[2L] else h
           strain <- ""
           if (length(parts) >= 3L) {
+            # IMGT species field is Genus_species[_strain]. The first two tokens
+            # are always Genus_species, so only a THIRD-or-later token is a real
+            # strain. A bare two-token field (Homo_sapiens, Mus_musculus) has no
+            # strain and must add no suffix — appending the species epithet
+            # ('_sapiens') was wrong.
             sp_parts <- strsplit(parts[3L], "_")[[1L]]
             if (length(sp_parts) >= 3L) {
               strain <- paste(sp_parts[seq(3L, length(sp_parts))], collapse="_")
-            } else if (length(sp_parts) == 2L) {
-              strain <- sp_parts[2L]
             }
           }
           if (nchar(strain) > 0L) paste0(gene_allele, "_", strain) else gene_allele
@@ -778,12 +790,37 @@ if (isTRUE(opt$as_is_ids)) {
       "#gene/allele name, first coding frame start position, chain type, CDR3 stop, extra bps beyond J coding end.",
       "#All positions are 0-based", ""), con_aux)
 
+    # Concordance-aware aux writer. Each gene/allele name is written once. The
+    # first occurrence keeps the canonical name. A repeat with the SAME values is
+    # a concordant duplicate, collapsed silently. A repeat with DIFFERENT values
+    # (e.g. a rescue-species allele that shares a name with an input allele but a
+    # different sequence, so a different inferred anchor) is a discordance: it is
+    # reported explicitly and kept under a '<name>_blendairr' suffix, so both
+    # survive and neither silently wins.
+    aux_seen  <- new.env(parent = emptyenv())
+    n_concord <- 0L; n_discord <- 0L
+    .aux_emit <- function(name, frame, ct, stop, extra, source = "inferred") {
+      val  <- paste(frame, ct, stop, extra, sep = "\t")
+      prev <- aux_seen[[name]]
+      if (is.null(prev)) {
+        writeLines(paste(name, val, sep = "\t"), con_aux); aux_seen[[name]] <- val
+        return(invisible("written"))
+      }
+      if (identical(prev, val)) { n_concord <<- n_concord + 1L; return(invisible("concordant")) }
+      n_discord <<- n_discord + 1L
+      cat(sprintf("  [AUX-DISCORDANCE] %s: existing '%s' vs %s '%s' differ; keeping both, new value as %s_blendairr\n",
+                  name, prev, source, val, name))
+      bn <- paste0(name, "_blendairr")
+      if (is.null(aux_seen[[bn]])) { writeLines(paste(bn, val, sep = "\t"), con_aux); aux_seen[[bn]] <- val }
+      invisible("discordant")
+    }
+
     # Copy legacy short names from reference
     if (!is.null(ref_aux_dt_ai)) {
       legacy_ai <- ref_aux_dt_ai[!grepl("\\*", gene) & grepl("^J[HKLA-Z]\\d", gene)]
       for (r in seq_len(nrow(legacy_ai)))
-        writeLines(paste(legacy_ai$gene[r], legacy_ai$frame[r], legacy_ai$chain_type[r],
-                         legacy_ai$cdr3_stop[r], legacy_ai$extra_bps[r], sep="\t"), con_aux)
+        .aux_emit(legacy_ai$gene[r], legacy_ai$frame[r], legacy_ai$chain_type[r],
+                  legacy_ai$cdr3_stop[r], legacy_ai$extra_bps[r], source = "reference-legacy")
       if (nrow(legacy_ai)) writeLines("", con_aux)
     }
 
@@ -799,7 +836,6 @@ if (isTRUE(opt$as_is_ids)) {
       names(j_ung) <- names(j_seqs)
       ct_key  <- sub("J$","",j_locus)            # IGHJ->IGH etc.
       ct_out  <- chain_map_ai[ct_key]
-      written_j <- character(0L)
       for (i in seq_along(j_ung)) {
         nm  <- names(j_ung)[i]
         nt  <- j_ung[i]
@@ -842,17 +878,12 @@ if (isTRUE(opt$as_is_ids)) {
             sequence = nt)
         }
 
-        writeLines(paste(nm, frame_val, ct_out,
-                         anchor_val, extra_val, sep="\t"), con_aux)
-        written_j <- c(written_j, nm)
+        .aux_emit(nm, frame_val, ct_out, anchor_val, extra_val)
 
         # ── Base-name alias (strip strain tag) ────────────────────────────
         base_nm <- sub("(\\*\\d+)_.*$", "\\1", nm)
-        if (base_nm != nm && !base_nm %in% written_j) {
-          writeLines(paste(base_nm, frame_val, ct_out,
-                           anchor_val, extra_val, sep="\t"), con_aux)
-          written_j <- c(written_j, base_nm)
-        }
+        if (base_nm != nm)
+          .aux_emit(base_nm, frame_val, ct_out, anchor_val, extra_val)
       }
     }
     # ── Append any reference J entries not already written ──────────────
@@ -864,18 +895,13 @@ if (isTRUE(opt$as_is_ids)) {
       ref_j_entries <- ref_aux_dt_ai[grepl("\\*", gene)]  # IMGT allele entries only
       n_added <- 0L
       for (r in seq_len(nrow(ref_j_entries))) {
-        nm_r <- ref_j_entries$gene[r]
-        # Normalise: strip strain tag for comparison
-        base_r <- sub("(\\*\\d+)_.*$", "\\1", nm_r)
-        if (!nm_r %in% written_j && !base_r %in% written_j) {
-          writeLines(paste(nm_r,
-                           ref_j_entries$frame[r],
-                           ref_j_entries$chain_type[r],
-                           ref_j_entries$cdr3_stop[r],
-                           ref_j_entries$extra_bps[r], sep="\t"), con_aux)
-          written_j <- c(written_j, nm_r, base_r)
-          n_added <- n_added + 1L
-        }
+        # Route through the concordance writer: a reference allele already
+        # emitted with the SAME anchor is collapsed; one with a DIFFERENT anchor
+        # than the inferred row is reported and kept as <name>_blendairr.
+        st <- .aux_emit(ref_j_entries$gene[r], ref_j_entries$frame[r],
+                        ref_j_entries$chain_type[r], ref_j_entries$cdr3_stop[r],
+                        ref_j_entries$extra_bps[r], source = "reference")
+        if (identical(st, "written")) n_added <- n_added + 1L
       }
       if (n_added > 0L)
         cat(sprintf("  [AUX] Appended %d reference J entries not in hybrid FASTAs\n",
@@ -883,7 +909,12 @@ if (isTRUE(opt$as_is_ids)) {
     }
     close(con_aux)
     cat(sprintf("  Wrote aux: %s (%d total entries)\n",
-                aux_path_ai, length(written_j)))
+                aux_path_ai, length(ls(aux_seen))))
+    if (n_discord > 0L)
+      cat(sprintf("  [AUX] %d duplicate J name(s) had DISCORDANT anchors (kept as *_blendairr; see [AUX-DISCORDANCE] above); %d concordant duplicate(s) collapsed\n",
+                  n_discord, n_concord))
+    else if (n_concord > 0L)
+      cat(sprintf("  [AUX] %d concordant duplicate J name(s) collapsed (identical anchors)\n", n_concord))
 
     # ── J-anchor validation report (sequence-identity ground truth) ──────
     if (length(.jaux_val) > 0L) {

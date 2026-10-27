@@ -25,6 +25,18 @@
 # REQUIRED
 #   -s, --species SPECIES   Closest IMGT reference species (e.g. mouse, human).
 #                           Run --list_species to see available options.
+#                           Use 'none' to build from the input alone with no
+#                           reference merge (novel species); name the build with
+#                           --prefix (e.g. --prefix MRL) so it never mixes with
+#                           an existing species. Works with --as-is-ids or
+#                           --asc/--trig_nc.
+#   --rescue_species SP     (with --species none) Backfill loci the input does
+#                           NOT provide, plus the constant genes, aux, leader and
+#                           domain models, from species SP (e.g. mouse). Provided
+#                           loci stay pure — SP's V genes are never blended into a
+#                           locus you supplied. E.g. MRL IGHV in, everything else
+#                           from mouse: --species none --rescue_species mouse
+#                           --prefix MRL.
 #   -i, --input_dir DIR     Directory containing custom germline FASTAs:
 #                             DIR/heavy/IGHV.fasta  (required)
 #                             DIR/heavy/IGHD.fasta  DIR/heavy/IGHJ.fasta
@@ -52,7 +64,9 @@
 #
 # OPTIONAL
 #   -g, --igdata DIR        IgBLAST share directory (default: $IGDATA or PATH).
-#   -p, --prefix STR        Output file prefix (default: hybrid).
+#   -p, --prefix STR        Output file prefix (default: hybrid; 'blendairr' for
+#                           --species none). Sets the organism name — e.g.
+#                           --prefix MRL with --species none builds organism MRL.
 #   -r, --rscript PATH      Path to Rscript binary (default: auto-detect).
 #   -e, --edit_imgt PATH    Path to edit_imgt_file.pl (default: auto-detect).
 #   --skip_blast            Annotation only; skip makeblastdb.
@@ -92,6 +106,7 @@ OUTDIR=""
 IGDATA="${IGDATA:-}"
 PREFIX="hybrid"
 PREFIX_USER_SET=false
+RESCUE_SPECIES=""
 RSCRIPT=""
 EDIT_IMGT=""
 SKIP_BLAST=false
@@ -134,6 +149,7 @@ usage() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -s|--species)           SPECIES="$2";        shift 2 ;;
+    --rescue_species|--rescue-species) RESCUE_SPECIES="$2"; shift 2 ;;
     -i|--input_dir)         INPUT_DIR="$2";      shift 2 ;;
     -o|--outdir)            OUTDIR="$2";         shift 2 ;;
     -g|--igdata)            IGDATA="$2";         shift 2 ;;
@@ -256,6 +272,25 @@ fi
 [[ -d "$INPUT_DIR" ]] || die "Input directory not found: $INPUT_DIR"
 
 # ---------------------------------------------------------------------------
+# Locate the VDJ germline directory for a species. Module scope so both the
+# reference-species path and the novel-mode rescue path (below) can use it.
+# ---------------------------------------------------------------------------
+find_ref_vdj_dir() {
+  local sp="$1" candidate base
+  # Docker image sets IGBLAST_GERMLINES to the bundled germlines root
+  if [[ -n "${IGBLAST_GERMLINES:-}" ]]; then
+    for candidate in "${IGBLAST_GERMLINES}/imgt/${sp}/vdj" "${IGBLAST_GERMLINES}/imgt/${sp}" "${IGBLAST_GERMLINES}/${sp}/vdj"; do
+      [[ -d "$candidate" ]] && { echo "$candidate"; return; }
+    done
+  fi
+  base="$IGDATA/germlines/imgt"
+  for candidate in "$base/$sp/vdj" "$base/$sp" "$IGDATA/germlines/imgt_${sp}" "$IGDATA/../germlines/imgt/$sp/vdj"; do
+    [[ -d "$candidate" ]] && { echo "$candidate"; return; }
+  done
+  echo ""
+}
+
+# ---------------------------------------------------------------------------
 # Novel-species mode: --species none. No IMGT/IgBLAST reference exists, so skip
 # the reference search entirely and run clustering + TRIG-NC on the custom input
 # alone. Relax the clustering trim unless the user set it, since novel-species
@@ -268,8 +303,14 @@ if [[ "$(printf '%s' "$SPECIES" | tr '[:upper:]' '[:lower:]')" == "none" ]]; the
   REF_CONST_DIR=""
   $V_TRIM_USER_SET || V_TRIM3=1000
   $J_TRIM_USER_SET || J_TRIM3=200
+  # A novel build is not a hybrid of an existing species, so name it 'blendairr'
+  # rather than 'hybrid' unless the user set --prefix. This keeps its organism
+  # out of the hybrid_*/reference-species namespace (e.g. build an MRL-only
+  # reference with --prefix MRL so it never mixes with the mouse alleles).
+  $PREFIX_USER_SET || PREFIX="blendairr"
   header "Novel-species mode (--species none)"
-  info "No reference merge or file copy; clustering + TRIG-NC on custom input only."
+  info "No reference merge or file copy; builds from custom input only (works with --as-is-ids or --asc/--trig_nc)."
+  info "Organism named from --prefix (default '$PREFIX'); set --prefix to name it, e.g. --prefix MRL."
   info "Permissive clustering trim: V<=$V_TRIM3, J<=$J_TRIM3 (override with --v_trim3 / --j_trim3)."
 fi
 
@@ -278,22 +319,6 @@ fi
 # ---------------------------------------------------------------------------
 if ! $NOVEL; then
 header "Locating reference germlines for species: $SPECIES"
-
-find_ref_vdj_dir() {
-  local sp="$1"
-  # Docker image sets IGBLAST_GERMLINES to the bundled germlines root
-  if [[ -n "${IGBLAST_GERMLINES:-}" ]]; then
-    for candidate in         "${IGBLAST_GERMLINES}/imgt/${sp}/vdj"         "${IGBLAST_GERMLINES}/imgt/${sp}"         "${IGBLAST_GERMLINES}/${sp}/vdj"; do
-      [[ -d "$candidate" ]] && { echo "$candidate"; return; }
-    done
-  fi
-  local base="$IGDATA/germlines/imgt"
-  # Try common layouts alongside IGDATA
-  for candidate in       "$base/$sp/vdj"       "$base/$sp"       "$IGDATA/germlines/imgt_${sp}"       "$IGDATA/../germlines/imgt/$sp/vdj"; do
-    [[ -d "$candidate" ]] && { echo "$candidate"; return; }
-  done
-  echo ""
-}
 
 REF_VDJ_DIR="$(find_ref_vdj_dir "$SPECIES")"
 if [[ -z "$REF_VDJ_DIR" ]]; then
@@ -320,6 +345,59 @@ fi   # end: if ! $NOVEL (reference location)
 # located reference VDJ dir, falling back to the input dir only when a species
 # reference was requested but not found.
 if $NOVEL; then REF_ARG=""; else REF_ARG="${REF_VDJ_DIR:-$INPUT_DIR}"; fi
+
+# ---------------------------------------------------------------------------
+# Rescue species backfill. With --species none, build a pure reference from the
+# input, but fill loci the input does NOT provide (and the constant genes) from
+# a rescue species, and install that species' aux/leader/domain models. Provided
+# loci are never blended; only truly-missing loci are backfilled. Implemented by
+# staging a copy of the input with the missing-locus FASTAs added, then running
+# the ordinary novel build on it, so provided loci stay pure while the aux and
+# ndm are built complete across every locus. The generated install script copies
+# the rescue species' constant/leader/leader_vexon/vdj_aa and domain models
+# (pdm/kabat) because the build cannot synthesise those.
+# ---------------------------------------------------------------------------
+if [[ -n "$RESCUE_SPECIES" ]]; then
+  $NOVEL || die "--rescue_species requires --species none (builds pure from input, backfills missing loci from the rescue species)."
+  header "Rescue species: $RESCUE_SPECIES (backfill missing loci + supporting files)"
+  RESCUE_VDJ_DIR="$(find_ref_vdj_dir "$RESCUE_SPECIES")"
+  [[ -n "$RESCUE_VDJ_DIR" ]] || die "Rescue reference not found for species '$RESCUE_SPECIES' (looked under \$IGBLAST_GERMLINES and \$IGDATA/germlines/imgt)."
+  RESCUE_CONST_DIR="$(dirname "$RESCUE_VDJ_DIR")/constant"
+  ok "Rescue VDJ dir: $RESCUE_VDJ_DIR"
+  [[ -d "$RESCUE_CONST_DIR" ]] && ok "Rescue constant dir: $RESCUE_CONST_DIR" \
+                               || warn "Rescue constant dir not found: $RESCUE_CONST_DIR"
+
+  INPUT_DIR_ORIG="$INPUT_DIR"
+  STAGING_DIR="$OUTDIR/rescue_input"
+  rm -rf "$STAGING_DIR"
+  mkdir -p "$STAGING_DIR/heavy" "$STAGING_DIR/light" "$STAGING_DIR/constant"
+
+  _find_input() {   # $1=locus -> path in the original input, or empty
+    local locus="$1" u
+    for u in "$INPUT_DIR_ORIG/heavy/${locus}.fasta" "$INPUT_DIR_ORIG/light/${locus}.fasta" \
+             "$INPUT_DIR_ORIG/constant/${locus}.fasta" "$INPUT_DIR_ORIG/${locus}.fasta"; do
+      [[ -f "$u" ]] && { echo "$u"; return; }
+    done
+    echo ""
+  }
+  _stage_seg() {    # $1=locus  $2=dest subdir (heavy|light|constant)  $3=rescue source dir
+    local locus="$1" sub="$2" rdir="$3" u r
+    local dest="$STAGING_DIR/$sub/${locus}.fasta"
+    u="$(_find_input "$locus")"
+    if [[ -n "$u" ]]; then cp "$u" "$dest"; info "  $locus: kept from input"; return; fi
+    for r in "$rdir/imgt_${RESCUE_SPECIES}_${locus}.fasta" "$rdir/${RESCUE_SPECIES}_${locus}.fasta" "$rdir/${locus}.fasta"; do
+      [[ -f "$r" ]] && { cp "$r" "$dest"; info "  $locus: backfilled from $RESCUE_SPECIES"; return; }
+    done
+    info "  $locus: absent in input and rescue; skipped"
+  }
+
+  for locus in IGHV IGHD IGHJ;        do _stage_seg "$locus" heavy    "$RESCUE_VDJ_DIR";   done
+  for locus in IGKV IGKJ IGLV IGLJ;   do _stage_seg "$locus" light    "$RESCUE_VDJ_DIR";   done
+  for locus in IGHC IGKC IGLC;        do _stage_seg "$locus" constant "$RESCUE_CONST_DIR"; done
+
+  INPUT_DIR="$STAGING_DIR"
+  ok "Staged rescue input: $STAGING_DIR (provided loci pure, missing loci from $RESCUE_SPECIES)"
+fi
 
 # ---------------------------------------------------------------------------
 # Locate helper tools
@@ -559,11 +637,17 @@ info "Debug R script written: $DEBUG_R"
 # automatically. An explicit --prefix always takes precedence.
 if { $USE_ASC || $USE_TRIG_NC; } && ! $PREFIX_USER_SET; then
   PREFIX="${PREFIX}_asc"
-  info "ASC/TRIG-NC mode: using default prefix '${PREFIX}' (organism '${PREFIX}_${SPECIES}')"
-  info "  Override with --prefix if you want a different name."
 fi
 
-ORGANISM="${PREFIX}_${SPECIES}"
+# Organism name. Reference-merged builds use <prefix>_<species> (e.g.
+# hybrid_mouse). A novel build (--species none) has no species to merge with, so
+# the organism is the prefix alone (default 'blendairr', or e.g. 'MRL' via
+# --prefix) — never '*_none' — keeping it out of the hybrid_*/species namespace.
+if $NOVEL; then ORGANISM="${PREFIX}"; else ORGANISM="${PREFIX}_${SPECIES}"; fi
+
+if { $USE_ASC || $USE_TRIG_NC; } && ! $PREFIX_USER_SET; then
+  info "ASC/TRIG-NC mode: using organism '${ORGANISM}'. Override with --prefix."
+fi
 
 # ---------------------------------------------------------------------------
 # Step 1: R annotation + germline construction
@@ -1174,10 +1258,10 @@ write_chain_script() {
 #   <makedb_outdir>/*_db-fail.tsv              Sequences failing annotation
 #
 # EMBEDDED PATHS (baked in at build time)
-#   DB prefix : \${_SCRIPT_DIR}/database/${PREFIX}
+#   DB prefix : \${_SCRIPT_DIR}/database/imgt_${ORGANISM}
 #   Aux file  : \${_SCRIPT_DIR}/auxiliary/${ORGANISM}_gl.aux
 #   IGDATA    : ${_ABS_OUTDIR}
-#   Organism  : ${SPECIES}
+#   Organism  : ${ORGANISM}
 # =============================================================================
 
 set -euo pipefail
@@ -1424,10 +1508,17 @@ $FORCE && echo "[FORCE] Existing files will be overwritten and databases rebuilt
 INSTALL_EOF_QUOTED
 
 cat >> "$INSTALL_CMD" <<INSTALL_EOF_BAKED
-# Closest reference species (e.g. mouse)
-REF_SPECIES="${SPECIES}"
-# Hybrid organism name used for internal_data/ and igblastn -organism.
-ORGANISM="${PREFIX}_${SPECIES}"
+# Species whose constant/leader/leader_vexon/vdj_aa and domain models (pdm/kabat)
+# are copied in and renamed to this organism. For a --rescue_species build that
+# is the rescue species (e.g. mouse); otherwise the build species. The V/D/J
+# FASTAs always come from the build output, so this never blends V genes — the
+# reference V/D/J copy is only a fallback for a locus the build did not produce.
+REF_SPECIES="${RESCUE_SPECIES:-$SPECIES}"
+# Hybrid organism name used for internal_data/ and igblastn -organism. Bake in
+# the organism the build actually used (${ORGANISM}); never recompute it as
+# ${PREFIX}_${SPECIES}, which appends '_none' for a novel build and would point
+# every lookup at files that were written under the real organism name.
+ORGANISM="${ORGANISM}"
 
 # Source paths derived relative to the install script's own location.
 # This works whether the script is run from inside a Docker container,
@@ -1437,8 +1528,8 @@ _SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 SRC_DB="\${_SCRIPT_DIR}/database"
 SRC_GAPPED="\${_SCRIPT_DIR}/germlines/gapped"
 SRC_AUX="\${_SCRIPT_DIR}/auxiliary/${ORGANISM}_gl.aux"
-SRC_NDM="\${_SCRIPT_DIR}/auxiliary/${PREFIX}_${SPECIES}.ndm.imgt"
-SRC_INTERNAL="\${_SCRIPT_DIR}/internal_data/${PREFIX}_${SPECIES}"
+SRC_NDM="\${_SCRIPT_DIR}/auxiliary/${ORGANISM}.ndm.imgt"
+SRC_INTERNAL="\${_SCRIPT_DIR}/internal_data/${ORGANISM}"
 INSTALL_EOF_BAKED
 
 cat >> "$INSTALL_CMD" <<'INSTALL_EOF_QUOTED2'

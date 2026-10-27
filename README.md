@@ -100,13 +100,29 @@ build_hybrid_igblast_ref --species human --input_dir ./ogrdb_human --outdir ./og
 
 Joint PIgLET clustering assigns each novel allele the next available IMGT-style name in its gene family. Every renamed allele differs from its input id, so downstream analysis must join on `annotations/<prefix>_name_map.tsv` (`source_id → new_allele`) to recover provenance.
 
-### `--species none` — novel species with no reference
+### `--species none` — novel species, built from the input alone
 
-For a species with no IMGT or IgBLAST reference, `--species none` runs clustering and TR/IG NC assignment on your input alone. Original ids are kept (illegal FASTA/`makeblastdb` characters sanitized to underscores), family and gene numbers are size-ranked from the clustering, and V/J clustering uses a relaxed 3-prime trim (override with `--v_trim3` / `--j_trim3`). `--ref_dir` and `--igdata` are optional; BLAST databases and a motif-inferred aux file are still built when the IgBLAST tools are available.
+For a species with no IMGT or IgBLAST reference, or any set you want kept separate from an existing species, `--species none` builds from your input alone with no reference merge, so the result never mixes with another species' alleles. It works with either naming mode: `--as-is-ids` keeps your input allele names verbatim, and `--asc`/`--trig_nc` runs clustering and assigns colon ids (family and gene numbers size-ranked from the clustering, original ids sanitized of illegal FASTA/`makeblastdb` characters). V/J clustering uses a relaxed 3-prime trim (override with `--v_trim3` / `--j_trim3`), and `--ref_dir` / `--igdata` are optional; BLAST databases and a motif-inferred aux file are still built when the IgBLAST tools are available.
+
+A novel build is named `blendairr` by default (rather than `hybrid`); set `--prefix` to name the organism, which keeps it out of the `hybrid_*` and reference-species namespace in a shared `IGDATA`.
 
 ```bash
-build_hybrid_igblast_ref --species none --input_dir ./novel_sp --outdir ./novel_asc_ref --asc --trig_nc
+# An MRL-only reference that never mixes with the mouse alleles — pick either mode
+build_hybrid_igblast_ref --species none --input_dir ./MRL --outdir ./mrl_ref   --prefix MRL --as-is-ids   # organism MRL
+build_hybrid_igblast_ref --species none --input_dir ./MRL --outdir ./mrl_trig  --prefix MRL --asc --trig_nc  # organism MRL, colon ids
 ```
+
+#### `--rescue_species` — backfill missing loci from another species
+
+If your input covers only some loci (say MRL heavy-chain V), add `--rescue_species` to fill the rest from an existing species without blending. The loci you provide stay pure (only your sequences), and every locus you do not provide, along with the constant genes, aux, leader and domain models, is taken from the rescue species. This builds a complete, self-contained organism whose V genes for a provided locus are never mixed with the rescue species' alleles.
+
+```bash
+# MRL IGHV only; IGHD, IGHJ, all light chain, constant, aux and domain models from mouse
+build_hybrid_igblast_ref --species none --rescue_species mouse \
+  --input_dir ./MRL --outdir ./mrl_ref --prefix MRL --as-is-ids
+```
+
+The rescue species must be installed in your `IGDATA` germlines (the same place `--species mouse` would read). The build stages the missing-locus FASTAs into the input and runs the ordinary novel build on them, so the aux and ndm come out complete across all loci, and the generated install script copies the rescue species' leader, `leader_vexon`, `vdj_aa` and `pdm`/`kabat` domain models (which the build cannot synthesise).
 
 ---
 
